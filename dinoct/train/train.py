@@ -85,15 +85,6 @@ def resolve_dataset_path(dataset_str: str) -> str:
     return ":".join(rebuilt) if tokens else dataset_str
 
 
-def parse_dataset_tokens(dataset_str: str) -> dict[str, str]:
-    tokens: dict[str, str] = {}
-    for token in dataset_str.split(":")[1:]:
-        if "=" in token:
-            k, v = token.split("=", 1)
-            tokens[k] = v
-    return tokens
-
-
 def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, int]:
     global_size = int(get_cfg(cfg, ("crops", "global_crops_size"), 224))
     local_size = int(get_cfg(cfg, ("crops", "local_crops_size"), 96))
@@ -703,9 +694,6 @@ def main() -> None:
         resolved_ds = resolve_dataset_path(
             get_cfg(cfg, ("train", "dataset_path"), "OCT:root=data/oct:extra=data/oct/extra")
         )
-        ds_tokens = parse_dataset_tokens(resolved_ds)
-        ds_root = ds_tokens.get("root", "data/oct")
-        ds_extra = ds_tokens.get("extra", "data/oct/extra")
         post_dir = output_dir / "post_train"
         post_dir.mkdir(parents=True, exist_ok=True)
         post_out = post_dir / "fused_curve.pth"
@@ -717,8 +705,7 @@ def main() -> None:
         run_post_training(
             backbone=backbone,
             patch_size=int(get_cfg(cfg, ("student", "patch_size"), 14)),
-            dataset_root=ds_root,
-            dataset_extra=ds_extra,
+            dataset_str=resolved_ds,
             steps=int(post_steps),
             batch_size=int(args.post_train_batch_size or post_cfg.get("batch_size", 128)),
             num_workers=int(get_cfg(cfg, ("train", "num_workers"), 4)),

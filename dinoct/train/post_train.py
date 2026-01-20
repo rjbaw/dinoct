@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
+from ..data import make_dataset
 from ..data.datasets import OCT
 from ..data.transforms import MaybeToTensor, make_normalize_transform
 import csv
@@ -477,8 +478,7 @@ def run_post_training(
     *,
     backbone: nn.Module,
     patch_size: int,
-    dataset_root: str,
-    dataset_extra: str,
+    dataset_str: str,
     steps: int,
     batch_size: int,
     num_workers: int,
@@ -508,7 +508,9 @@ def run_post_training(
     if metrics_path.stat().st_size == 0:
         metrics_writer.writerow(["step", "loss", "mae_px", "loss_presence", "loss_curve", "loss_curv", "p_curve"])
 
-    ds_full = OCT(root=dataset_root, extra=dataset_extra, transform=_make_oct_transform())
+    ds_full = make_dataset(dataset_str=dataset_str, transform=_make_oct_transform())
+    if not isinstance(ds_full, OCT):
+        raise TypeError(f"Expected OCT dataset for post-training; got {type(ds_full)}")
     entries = ds_full._get_entries()
     valid_mask = entries["code"] != 0
     valid_idx = np.nonzero(valid_mask)[0].tolist()

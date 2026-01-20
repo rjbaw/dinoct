@@ -60,13 +60,12 @@ ibot:
   head_hidden_dim: 2048
 train:
   batch_size_per_gpu: 64
-  dataset_path: ImageNet:split=TRAIN
+  dataset_path: OCT:root=data/oct
   output_dir: .
   saveckp_freq: 20
   seed: 0
   num_workers: 10
   OFFICIAL_EPOCH_LENGTH: 1250
-  OFFICIAL_EPOCH_LENGTH: 500
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
 student:

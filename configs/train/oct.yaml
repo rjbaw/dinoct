@@ -5,10 +5,11 @@ ibot:
   separate_head: true
   head_n_prototypes: 131072
 train:
-  dataset_path: OCT:root=data/oct:extra=data/oct/extra
+  dataset_path: OCT:root=data/oct:hub=rjbaw/oct
   batch_size_per_gpu: 32
   centering: sinkhorn_knopp
   mp_start_method: spawn
+  OFFICIAL_EPOCH_LENGTH: 500
 student:
   arch: convnext_tiny
   patch_size: 14

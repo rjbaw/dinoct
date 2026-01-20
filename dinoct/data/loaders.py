@@ -5,6 +5,7 @@
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -13,6 +14,8 @@ from .datasets import OCT
 
 
 logger = logging.getLogger("dinoct")
+
+_DINOCT_CACHE_DIR = Path(os.environ.get("DINOCT_CACHE_DIR", Path.home() / ".cache" / "dinoct"))
 
 
 def _make_bool_str(b: bool) -> str:
@@ -35,19 +38,106 @@ def _parse_dataset_str(dataset_str: str):
     tokens = dataset_str.split(":")
 
     name = tokens[0].strip().upper()
-    kwargs = {}
+    kwargs: dict[str, str] = {}
 
     for token in tokens[1:]:
-        key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        if not token:
+            continue
+        if "=" not in token:
+            raise ValueError(f'Invalid dataset token "{token}". Expected "key=value".')
+        key, value = token.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key not in ("root", "extra", "split", "hub", "revision", "subdir", "cache_dir"):
+            raise ValueError(f'Unsupported dataset option "{key}" in "{dataset_str}"')
         kwargs[key] = value
 
     if name == "OCT":
+        kwargs = _resolve_oct_dataset_kwargs(kwargs)
         class_ = OCT
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 
     return class_, kwargs
+
+
+def _resolve_oct_dataset_kwargs(kwargs: dict[str, str]) -> dict[str, str]:
+    """
+    Normalizes OCT dataset kwargs.
+
+    Supports either:
+      - Local paths: OCT:root=/path/to/oct[:extra=/path/to/extra]
+      - Hugging Face Hub dataset repo: OCT:hub=<user/dataset>[:revision=...][:subdir=...][:cache_dir=...][:extra=...]
+    """
+    if "split" in kwargs:
+        raise ValueError('OCT dataset does not support "split=". Remove it from the dataset string.')
+
+    root = kwargs.get("root")
+    prefer_local = root is not None and Path(root).exists()
+
+    if "hub" in kwargs and not prefer_local:
+        repo_id = kwargs.pop("hub")
+        # If an (absent) root was supplied as a fallback, it will be overwritten by the Hub snapshot path.
+        kwargs.pop("root", None)
+
+        revision = kwargs.pop("revision", None) or None
+        subdir = kwargs.pop("subdir", None) or None
+        cache_dir = kwargs.pop("cache_dir", None) or None
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ModuleNotFoundError as exc:  # pragma: no cover
+            raise ModuleNotFoundError(
+                'Hugging Face dataset support requires "huggingface-hub". Install with `uv sync --extra hf`.'
+            ) from exc
+
+        snapshot_root = snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        root = Path(snapshot_root)
+        if subdir is not None:
+            root = root / subdir
+        if not root.exists():
+            raise FileNotFoundError(f'Hugging Face dataset path does not exist: "{root}"')
+
+        kwargs["root"] = str(root)
+
+        if "extra" not in kwargs:
+            # Do not write metadata caches into the HF snapshot; keep them in a separate cache dir.
+            safe_repo = repo_id.replace("/", "__").replace("\\", "__")
+            safe_rev = (revision or "main").replace("/", "__").replace("\\", "__")
+            safe_subdir = (subdir or "").replace("/", "__").replace("\\", "__")
+            base = _DINOCT_CACHE_DIR / "datasets" / "hf" / safe_repo / safe_rev
+            if safe_subdir:
+                base = base / safe_subdir
+            kwargs["extra"] = str(base / "extra")
+    else:
+        if "hub" in kwargs:
+            # Prefer local root if it exists. If both root+hub are provided, ignore hub-specific options.
+            kwargs.pop("hub", None)
+            kwargs.pop("revision", None)
+            kwargs.pop("subdir", None)
+            kwargs.pop("cache_dir", None)
+        else:
+            for key in ("revision", "subdir", "cache_dir"):
+                if key in kwargs:
+                    raise ValueError(f'OCT dataset option "{key}=" is only valid when using "hub=".')
+
+    if "root" not in kwargs:
+        raise ValueError('OCT dataset requires "root=<path>" or "hub=<user/dataset>".')
+
+    # Make "extra" optional for local datasets.
+    if "extra" not in kwargs:
+        kwargs["extra"] = str(Path(kwargs["root"]) / "extra")
+
+    extra_keys = set(kwargs) - {"root", "extra"}
+    if extra_keys:
+        raise ValueError(f"OCT dataset has unsupported options: {sorted(extra_keys)}")
+
+    return kwargs
 
 
 def make_dataset(

@@ -2,6 +2,8 @@
 
 DINO-style self-supervised pretraining for OCT B-scan images, plus curve head (LoRA) post-train stage.
 
+![](./oct.jpg)
+
 ## Repo layout
 
 - `dinoct/`: Python package (models, data, training)
@@ -33,7 +35,7 @@ Each label file should contain either:
 - 500 floats (one per column), or
 - a 500×2 table `(x, y)` (the second column is used).
 
-You can change the dataset paths via the dataset string: `oct:root=<root>:extra=<extra>` (see `configs/train/oct.yaml`).
+You can change the dataset paths via the dataset string: `OCT:root=<root>[:extra=<extra>]` (see `configs/train/oct.yaml`).
 In that string, `root`/`extra` refer to dataset directories (not the repo root).
 The dataset name token is case-insensitive.
 
