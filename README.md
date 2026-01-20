@@ -106,6 +106,9 @@ uv run python scripts/visualize.py \
 uv run python scripts/export_model.py --model outputs/run1/post_train/fused_curve.pth --outdir exports
 ```
 
+## Dataset
+Dataset are available from [https://huggingface.co/datasets/rjbaw/oct](https://huggingface.co/datasets/rjbaw/oct) and using the huggingface dataset loader.
+
 ## License
 Apache-2.0.  
 
