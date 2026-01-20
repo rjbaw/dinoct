@@ -1,0 +1,44 @@
+[project]
+name = "dinoct"
+version = "0.0.1"
+description = "DINO-style pretraining and simple curve post-training for OCT B-scan images."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "torch>=2.9.0",
+    "torchvision>=0.24.0",
+    "pyyaml>=6.0",
+    "onnxscript>=0.5.6",
+]
+
+[project.optional-dependencies]
+label = [
+    "matplotlib>=3.8.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [
+    ".uv_cache",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

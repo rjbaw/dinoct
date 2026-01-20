@@ -1,0 +1,47 @@
+dino:
+  head_n_prototypes: 131072
+  head_bottleneck_dim: 384
+ibot:
+  separate_head: true
+  head_n_prototypes: 131072
+train:
+  dataset_path: OCT:root=data/oct:extra=data/oct/extra
+  batch_size_per_gpu: 32
+  centering: sinkhorn_knopp
+  mp_start_method: spawn
+student:
+  arch: convnext_tiny
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  block_chunks: 4
+teacher:
+  momentum_teacher: 0.994
+optim:
+  epochs: 1000
+  weight_decay_end: 0.2
+  base_lr: 2.0e-04  # learning rate for a batch size of 1024
+  #base_lr: 2.0e-08  # learning rate for a batch size of 1024
+  warmup_epochs: 80
+  layerwise_decay: 1.0
+crops:
+  local_crops_size: 98
+post_train:
+  steps: 80000
+  method: adamw
+  sam:
+    rho: 0.05
+  batch_size: 256
+  lr_head: 5.0e-04
+  lr_lora: 1.0e-04
+  wd_head: 5.0e-04
+  wd_lora: 0.0
+  sigma: 1.5
+  lambda_bg: 1.0
+  lambda_curve: 1.0
+  lambda_curv: 0.05
+  lora_blocks: 3
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_use_mlp: false
