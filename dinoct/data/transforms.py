@@ -38,6 +38,35 @@ class MaybeToTensor(transforms.ToTensor):
         return super().__call__(pic)
 
 
+class Ensure3CH:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # x: CxHxW
+        if x.ndim == 3 and x.shape[0] == 1:
+            return x.expand(3, -1, -1)
+        return x
+
+
+class PerImageZScore:
+    def __init__(self, eps: float = 1e-6):
+        self.eps = eps
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # x: CxHxW, float (ToTensor gives [0,1])
+        x = x.float()
+        mean = x.mean()
+        std = x.std(unbiased=False)
+        return (x - mean) / (std + self.eps)
+
+
+class Clamp:
+    def __init__(self, lo: float = -5.0, hi: float = 5.0):
+        self.lo = lo
+        self.hi = hi
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x.clamp(self.lo, self.hi)
+
+
 # Use timm's names
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -66,7 +95,8 @@ def make_classification_train_transform(
     transforms_list.extend(
         [
             MaybeToTensor(),
-            make_normalize_transform(mean=mean, std=std),
+            Ensure3CH(),
+            PerImageZScore(eps=1e-6),
         ]
     )
     return transforms.Compose(transforms_list)
@@ -86,6 +116,7 @@ def make_classification_eval_transform(
         transforms.Resize(resize_size, interpolation=interpolation),
         transforms.CenterCrop(crop_size),
         MaybeToTensor(),
-        make_normalize_transform(mean=mean, std=std),
+        Ensure3CH(),
+        PerImageZScore(eps=1e-6),
     ]
     return transforms.Compose(transforms_list)

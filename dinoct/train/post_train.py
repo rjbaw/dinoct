@@ -15,10 +15,9 @@ from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
-
 from ..data import make_dataset
 from ..data.datasets import OCT
-from ..data.transforms import MaybeToTensor, make_normalize_transform
+from ..data.transforms import Ensure3CH, MaybeToTensor, PerImageZScore
 import csv
 
 ORIG_H, ORIG_W = 512, 500
@@ -34,9 +33,9 @@ def pad_to_multiple_hw(x: torch.Tensor, multiple: int) -> tuple[torch.Tensor, tu
     return x, (pad_h, pad_w)
 
 
-@torch.no_grad()
+# @torch.no_grad()
 def soft_argmax_height(logits_hw: torch.Tensor) -> torch.Tensor:
-    """Column-wise softmax over H then soft-argmax → (B, W)."""
+    """Column-wise softmax over H then soft-argmax → (B, W). Differentiable."""
     _, H, _ = logits_hw.shape
     p = F.softmax(logits_hw, dim=1)
     grid = torch.arange(H, device=logits_hw.device, dtype=logits_hw.dtype).view(1, H, 1)
@@ -163,17 +162,10 @@ def apply_lora_to_backbone(
     )
 
 
-class PresenceHead(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 256, p: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(p), nn.Linear(hidden, 1))
-
-    def forward(self, cls_feat: torch.Tensor) -> torch.Tensor:
-        return self.net(cls_feat).squeeze(-1)
-
-
 class CurveHead(nn.Module):
-    """Light conv decoder: vertical depthwise convs, then upsample."""
+    """Light conv decoder producing per-column (H+1)-class logits:
+    classes 0..H-1 = curve at row y, class H = no-curve.
+    """
 
     def __init__(self, in_channels: int, mid: int = 128):
         super().__init__()
@@ -182,53 +174,107 @@ class CurveHead(nn.Module):
         self.act1 = nn.GELU()
         self.vert2 = nn.Conv2d(mid, mid, kernel_size=(5, 1), padding=(2, 0), groups=mid)
         self.act2 = nn.GELU()
-        self.out = nn.Conv2d(mid, 1, kernel_size=1, bias=True)
+        self.out_y = nn.Conv2d(mid, 1, kernel_size=1, bias=True)
+        self.out_none = nn.Conv2d(mid, 1, kernel_size=1, bias=True)
 
     def forward(self, tokens_hw: torch.Tensor, out_size_hw: tuple[int, int]) -> torch.Tensor:
         x = self.proj(tokens_hw)
         x = self.act1(self.vert1(x))
         x = self.act2(self.vert2(x))
-        x = self.out(x)
-        x = F.interpolate(x, size=out_size_hw, mode="bilinear", align_corners=False)
-        return x.squeeze(1)
+
+        H_out, W_out = out_size_hw
+
+        # y logits map -> upsample to (H_out, W_out)
+        y_logits = self.out_y(x)
+        y_logits = F.interpolate(y_logits, size=(H_out, W_out), mode="bilinear", align_corners=False)
+        y_logits = y_logits.squeeze(1)
+
+        # no-curve logits per column
+        col_feat = x.mean(dim=2, keepdim=True)
+        none_logits = self.out_none(col_feat)
+        none_logits = F.interpolate(none_logits, size=(1, W_out), mode="bilinear", align_corners=False)
+        none_logits = none_logits.squeeze(1).squeeze(1)
+
+        return torch.cat([y_logits, none_logits.unsqueeze(1)], dim=1)
 
 
 @dataclass
 class LossCfg:
     sigma: float = 1.5
-    lambda_bg: float = 1.0
+    lambda_bg: float = 0.01
     lambda_curve: float = 1.0
     lambda_curv: float = 0.05
-    pos_weight_pos: float = 1.0
+    bg_weight: float = 20.0
+
+
+def column_ce_loss_h1w(
+    logits_h1w: torch.Tensor,
+    targets_h1w: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Cross-entropy over columns for (H+1)-class logits, optionally sample-weighted."""
+    logp = F.log_softmax(logits_h1w, dim=1)  # (B,H+1,W)
+    ce_per_col = -(targets_h1w * logp).sum(dim=1)  # (B,W)
+    ce_per_sample = ce_per_col.mean(dim=1)  # (B,)
+    if sample_weight is None:
+        return ce_per_sample.mean()
+    w = sample_weight.float()
+    return (ce_per_sample * w).sum() / (w.sum() + 1e-8)
 
 
 class CurveLoss(nn.Module):
     def __init__(self, cfg: LossCfg):
         super().__init__()
         self.cfg = cfg
-        self.register_buffer("_pos_weight", torch.tensor([cfg.pos_weight_pos], dtype=torch.float32), persistent=False)
 
     def forward(
         self, presence_logits: torch.Tensor, curve_logits: torch.Tensor, y_curve: torch.Tensor, is_bg: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cfg = self.cfg
+        B, H1, W = curve_logits.shape
+        H = H1 - 1
         has_curve = (1 - is_bg).float()
+        non_bg = has_curve
+
         loss_presence = F.binary_cross_entropy_with_logits(
             presence_logits,
             has_curve,
-            pos_weight=self._pos_weight.to(device=presence_logits.device, dtype=presence_logits.dtype),
         )
-        non_bg = (1 - is_bg).float()
+
         with torch.no_grad():
-            targets = gaussian_targets_from_y(y_curve, H=curve_logits.shape[1], sigma=cfg.sigma)
-        loss_curve = column_ce_loss(curve_logits, targets, non_bg)
-        loss_curv = curvature_loss_from_logits(curve_logits, non_bg)
+            g = gaussian_targets_from_y(y_curve, H=H, sigma=cfg.sigma)
+            non_bg_ = non_bg.view(B, 1, 1)
+            targets_y = g * non_bg_  # curve imgs: gaussian; bg imgs: 0
+            targets_none = is_bg.float().view(B, 1, 1).expand(B, 1, W)  # bg imgs: 1; curve imgs: 0
+            targets = torch.cat([targets_y, targets_none], dim=1)
+
+        w = torch.ones((B,), device=curve_logits.device, dtype=curve_logits.dtype)
+        w = torch.where(is_bg.bool(), w * float(cfg.bg_weight), w)
+
+        loss_curve = column_ce_loss_h1w(curve_logits, targets, sample_weight=w)
+        loss_curv = curvature_loss_from_logits(curve_logits[:, :H, :], non_bg_mask=non_bg)
         total = cfg.lambda_bg * loss_presence + cfg.lambda_curve * loss_curve + cfg.lambda_curv * loss_curv
         return total, {
             "loss_presence": loss_presence.detach(),
             "loss_curve": loss_curve.detach(),
             "loss_curv": loss_curv.detach(),
         }
+
+
+def freeze_backbone_except_lora_and_norms(backbone: nn.Module, train_norms: bool = True):
+    for p in backbone.parameters():
+        p.requires_grad = False
+    # LoRA params are nn.Parameter, so ensure they remain trainable
+    for m in backbone.modules():
+        if isinstance(m, LoRALinear):
+            m.lora_A.requires_grad = True
+            m.lora_B.requires_grad = True
+
+    if train_norms:
+        for m in backbone.modules():
+            if isinstance(m, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm2d)):
+                for p in m.parameters():
+                    p.requires_grad = True
 
 
 class CurveModel(nn.Module):
@@ -243,25 +289,32 @@ class CurveModel(nn.Module):
             dropout=float(lora_cfg.get("dropout", 0.05)),
             use_mlp=bool(lora_cfg.get("use_mlp", False)),
         )
+        freeze_backbone_except_lora_and_norms(backbone)
         C = getattr(backbone, "embed_dim", backbone.num_features if hasattr(backbone, "num_features") else 768)
-        self.pres_head = PresenceHead(C)
         self.curve_head = CurveHead(C)
         self.patch_size = patch_size
 
     def forward(
         self, images_3chw: torch.Tensor, *, orig_hw: tuple[int, int] = (ORIG_H, ORIG_W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, (pad_h, pad_w) = pad_to_multiple_hw(images_3chw, self.patch_size)
+        x, _ = pad_to_multiple_hw(images_3chw, self.patch_size)
         H_pad, W_pad = x.shape[-2], x.shape[-1]
         outputs = self.backbone.forward_features(x)
-        cls = outputs[0]["x_norm_clstoken"]
+        # cls = outputs[0]["x_norm_clstoken"]
         patch_tokens = outputs[0]["x_norm_patchtokens"]
         H_tokens = H_pad // self.patch_size
         W_tokens = W_pad // self.patch_size
         tokens_hw = patch_tokens.reshape(x.shape[0], H_tokens, W_tokens, -1).permute(0, 3, 1, 2).contiguous()
-        presence_logits = self.pres_head(cls)
-        curve_logits_pad = self.curve_head(tokens_hw, (H_pad, W_pad))
-        curve_logits = curve_logits_pad[:, : orig_hw[0], : orig_hw[1]]
+
+        logits_pad = self.curve_head(tokens_hw, (H_pad, W_pad))
+        H0, W0 = orig_hw
+        y_logits = logits_pad[:, :H0, :W0]
+        none_logits = logits_pad[:, -1, :W0]
+        curve_logits = torch.cat([y_logits, none_logits.unsqueeze(1)], dim=1)
+        p = F.softmax(curve_logits.float(), dim=1)
+        p_none = p[:, -1, :].mean(dim=1).clamp(1e-4, 1 - 1e-4)
+        presence_logits = torch.log((1.0 - p_none) / p_none).to(curve_logits.dtype)
+
         return presence_logits, curve_logits
 
 
@@ -287,7 +340,8 @@ def _make_oct_transform() -> transforms.Compose:
         [
             transforms.Resize((ORIG_H, ORIG_W), interpolation=InterpolationMode.BICUBIC),
             MaybeToTensor(),
-            make_normalize_transform(),
+            Ensure3CH(),
+            PerImageZScore(eps=1e-6),
         ]
     )
 
@@ -420,7 +474,7 @@ def train_step(
     with torch.no_grad():
         p_curve = torch.sigmoid(presence_logits)
         mask = (1 - is_bg).float()
-        y_hat = soft_argmax_height(curve_logits)
+        y_hat = soft_argmax_height(curve_logits[:, :-1, :])
         mae = ((y_hat - y).abs().mean(dim=1) * mask).sum() / (mask.sum() + 1e-8)
     return {
         "loss": float(loss.detach().cpu()),
@@ -460,7 +514,7 @@ def validate(
 
         mask = (1 - is_bg).float()
         if mask.sum().item() > 0:
-            y_hat = soft_argmax_height(curve_logits)
+            y_hat = soft_argmax_height(curve_logits[:, :-1, :])
             mae_sum += ((y_hat - y).abs().mean(dim=1) * mask).sum().item()
             mae_cnt += mask.sum().item()
     denom = max(n_samples, 1.0)
@@ -479,6 +533,7 @@ def run_post_training(
     backbone: nn.Module,
     patch_size: int,
     dataset_str: str,
+    seed: int = 0,
     steps: int,
     batch_size: int,
     num_workers: int,
@@ -512,12 +567,28 @@ def run_post_training(
     if not isinstance(ds_full, OCT):
         raise TypeError(f"Expected OCT dataset for post-training; got {type(ds_full)}")
     entries = ds_full._get_entries()
-    valid_mask = entries["code"] != 0
-    valid_idx = np.nonzero(valid_mask)[0].tolist()
-    n_valid = len(valid_idx)
-    val_count = max(n_valid // 10, 1)
-    train_idx = valid_idx[: n_valid - val_count]
-    val_idx = valid_idx[n_valid - val_count :]
+
+    # Stratified split to ensure both curve and background appear in train/val.
+    curve_idx = np.nonzero(entries["code"] == 1)[0]
+    bg_idx = np.nonzero(entries["code"] == 2)[0]
+    if curve_idx.size == 0:
+        raise ValueError("Post-train requires labeled curve samples (entries with code==1); none found.")
+    if bg_idx.size == 0:
+        raise ValueError("Post-train requires background samples (entries with code==2); none found.")
+
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(curve_idx)
+    rng.shuffle(bg_idx)
+    val_frac = 0.1
+    val_curve = int(round(curve_idx.size * val_frac))
+    val_bg = int(round(bg_idx.size * val_frac))
+    val_curve = max(1, min(val_curve, int(curve_idx.size) - 1))
+    val_bg = max(1, min(val_bg, int(bg_idx.size) - 1))
+
+    train_idx = np.concatenate([curve_idx[val_curve:], bg_idx[val_bg:]]).tolist()
+    val_idx = np.concatenate([curve_idx[:val_curve], bg_idx[:val_bg]]).tolist()
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
 
     ds: Subset
     dl: DataLoader
@@ -545,7 +616,6 @@ def run_post_training(
 
     num_bg = int((entries["code"] == 2).sum())
     num_curve = int((entries["code"] == 1).sum())
-    pos_weight_pos = max((num_bg + 1) / (num_curve + 1), 1.0)
 
     model = CurveModel(
         backbone,
@@ -564,7 +634,6 @@ def run_post_training(
             lambda_bg=lambda_bg,
             lambda_curve=lambda_curve,
             lambda_curv=lambda_curv,
-            pos_weight_pos=pos_weight_pos,
         )
     )
     opt = build_optimizer(model, lr_head=lr_head, wd_head=wd_head, lr_lora=lr_lora, wd_lora=wd_lora)
@@ -668,6 +737,5 @@ __all__ = [
     "CurveModel",
     "CurveLoss",
     "CurveHead",
-    "PresenceHead",
     "LoRALinear",
 ]

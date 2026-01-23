@@ -706,6 +706,7 @@ def main() -> None:
             backbone=backbone,
             patch_size=int(get_cfg(cfg, ("student", "patch_size"), 14)),
             dataset_str=resolved_ds,
+            seed=int(get_cfg(cfg, ("train", "seed"), 0)),
             steps=int(post_steps),
             batch_size=int(args.post_train_batch_size or post_cfg.get("batch_size", 128)),
             num_workers=int(get_cfg(cfg, ("train", "num_workers"), 4)),

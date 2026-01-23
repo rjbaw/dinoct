@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dinoct.data.transforms import MaybeToTensor, make_normalize_transform  # noqa: E402
+from dinoct.data.transforms import Ensure3CH, MaybeToTensor, PerImageZScore  # noqa: E402
 from dinoct.models import build_backbone  # noqa: E402
 from dinoct.train.post_train import (  # noqa: E402
     CurveModel,
@@ -155,7 +155,8 @@ def make_feature_transform(image_size: int) -> transforms.Compose:
             transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
             transforms.CenterCrop(image_size),
             MaybeToTensor(),
-            make_normalize_transform(),
+            Ensure3CH(),
+            PerImageZScore(eps=1e-6),
         ]
     )
 
@@ -165,7 +166,8 @@ def make_curve_transform() -> transforms.Compose:
         [
             transforms.Resize((ORIG_H, ORIG_W), interpolation=InterpolationMode.BICUBIC),
             MaybeToTensor(),
-            make_normalize_transform(),
+            Ensure3CH(),
+            PerImageZScore(eps=1e-6),
         ]
     )
 
@@ -460,10 +462,14 @@ def infer_backbone_spec_from_state_dict(state: dict[str, Any]) -> tuple[str | No
 
 def prepare_curve_model(args: argparse.Namespace, *, device: torch.device) -> tuple[CurveModel, transforms.Compose]:
     ckpt_path = Path(args.curve_ckpt) if args.curve_ckpt else None
+    if ckpt_path is None:
+        best = REPO_ROOT / "outputs" / "post_train" / "fused_curve_best.pth"
+        final = REPO_ROOT / "outputs" / "post_train" / "fused_curve.pth"
+        ckpt_path = best if best.exists() else final
     if ckpt_path is None or not ckpt_path.exists():
         raise FileNotFoundError(
             f"Curve checkpoint not found: {ckpt_path or '<missing>'}. "
-            "Pass `--curve-ckpt outputs/post_train/fused_curve.pth`."
+            "Pass `--curve-ckpt outputs/.../post_train/fused_curve_best.pth`."
         )
 
     ckpt = _torch_load(ckpt_path)
@@ -515,7 +521,7 @@ def run_curve_image(
     with torch.inference_mode():
         presence_logits, curve_logits = model(x, orig_hw=(ORIG_H, ORIG_W))
         p_curve = float(torch.sigmoid(presence_logits).detach().cpu().float().reshape(-1)[0].item())
-        y_vec = soft_argmax_height(curve_logits).detach().cpu().float().numpy().reshape(-1)
+        y_vec = soft_argmax_height(curve_logits[:, :-1, :]).detach().cpu().float().numpy().reshape(-1)
         prob_hw = torch.softmax(curve_logits, dim=1)[0].detach().cpu().float().numpy()
 
     writer.path("curve_presence.txt").write_text(f"{p_curve:.6f}\n")
@@ -866,7 +872,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Curve model
-    parser.add_argument("--curve-ckpt", default=str(REPO_ROOT / "outputs" / "post_train" / "fused_curve.pth"))
+    parser.add_argument("--curve-ckpt", default=str(REPO_ROOT / "outputs" / "post_train" / "fused_curve_best.pth"))
     parser.add_argument(
         "--curve-uncertainty", action="store_true", help="Write curve uncertainty CSV + summary txt (entropy/maxprob)"
     )

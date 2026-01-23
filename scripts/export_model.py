@@ -59,10 +59,10 @@ class ExportWrapper(nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor):
-        logits_pres, logits_curve = self.model(x)
-        p_curve = torch.sigmoid(logits_pres)
-        y_vec = soft_argmax_height_jit_safe(logits_curve)
-        return p_curve, y_vec, logits_curve
+        presence_logits, curve_logits = self.model(x)  # curve_logits: (B, H+1, W)
+        y_logits = curve_logits[:, :-1, :]  # (B, H, W)
+        y_vec = soft_argmax_height_jit_safe(y_logits)  # (B, W)
+        return presence_logits, y_vec
 
 
 def infer_backbone_from_curve_state_dict(state_dict: dict) -> str:
@@ -159,7 +159,7 @@ def main():
     ap.add_argument("--backbone", choices=["auto", "small", "convnext_tiny", "convnext_small"], default="auto")
     ap.add_argument(
         "--model",
-        default="outputs/post_train/fused_curve.pth",
+        default="outputs/post_train/fused_curve_best.pth",
         help="Path to fused_curve.pth (preferred single checkpoint)",
     )
     ap.add_argument("--outdir", default="exports")
@@ -192,8 +192,8 @@ def main():
 
     onnx_path = Path(args.outdir) / "curve_model.onnx"
     log.info(f"Exporting ONNX opset={args.opset} -> {onnx_path}")
-    dyn = {"image": {0: "batch"}, "p_curve": {0: "batch"}, "y_vec": {0: "batch"}, "curve_logits": {0: "batch"}}
-    out_names = ["p_curve", "y_vec", "curve_logits"]
+    dyn = {"image": {0: "batch"}, "presence_logits": {0: "batch"}, "y_vec": {0: "batch"}}
+    out_names = ["presence_logits", "y_vec"]
 
     with torch.inference_mode():
         try:

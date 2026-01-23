@@ -8,8 +8,9 @@ import torchvision.transforms.v2 as tv
 from .transforms import (
     IMAGENET_DEFAULT_MEAN,
     IMAGENET_DEFAULT_STD,
+    Ensure3CH,
     GaussianBlur,
-    make_normalize_transform,
+    PerImageZScore,
 )
 
 logger = logging.getLogger("dinoct")
@@ -143,7 +144,8 @@ class DataAugmentationDINO(object):
             [
                 tv.ToImage(),
                 tv.ToDtype(torch.float32, scale=True),
-                make_normalize_transform(mean=mean, std=std),
+                Ensure3CH(),
+                PerImageZScore(eps=1e-6),
             ]
         )
         if self.share_color_jitter:

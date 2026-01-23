@@ -95,7 +95,7 @@ Outputs:
 ```bash
 uv run python scripts/visualize.py \
   --mode curve \
-  --curve-ckpt outputs/run1/post_train/fused_curve.pth \
+  --curve-ckpt outputs/run1/post_train/fused_curve_best.pth \
   --input path/to/image_or_dir \
   --outdir outputs/viz
 ```
@@ -103,7 +103,7 @@ uv run python scripts/visualize.py \
 ## Export (TorchScript/ONNX)
 
 ```bash
-uv run python scripts/export_model.py --model outputs/run1/post_train/fused_curve.pth --outdir exports
+uv run python scripts/export_model.py --model outputs/run1/post_train/fused_curve_best.pth --outdir exports
 ```
 
 ## Dataset
