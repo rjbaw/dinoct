@@ -107,7 +107,8 @@ uv run python scripts/export_model.py --model outputs/run1/post_train/fused_curv
 ```
 
 ## Dataset
-Dataset are available from [https://huggingface.co/datasets/rjbaw/oct](https://huggingface.co/datasets/rjbaw/oct) and using the huggingface dataset loader.
+Dataset are available from [https://huggingface.co/datasets/rjbaw/oct](https://huggingface.co/datasets/rjbaw/oct) and using the huggingface dataset loader.  
+Set `train.dataset_path` to `OCT:hub=rjbaw/oct` (or include `root=...` for local-first).
 
 ## License
 Apache-2.0.  

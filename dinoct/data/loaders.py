@@ -6,8 +6,11 @@
 import logging
 import os
 from pathlib import Path
+import shutil
+import tarfile
 from typing import Any, Callable, Optional, TypeVar
 
+from huggingface_hub import hf_hub_download
 import torch
 
 from .datasets import OCT
@@ -16,23 +19,7 @@ from .datasets import OCT
 logger = logging.getLogger("dinoct")
 
 _DINOCT_CACHE_DIR = Path(os.environ.get("DINOCT_CACHE_DIR", Path.home() / ".cache" / "dinoct"))
-
-
-def _make_bool_str(b: bool) -> str:
-    return "yes" if b else "no"
-
-
-def _make_sample_transform(image_transform: Optional[Callable] = None, target_transform: Optional[Callable] = None):
-    def transform(sample):
-        image, target = sample
-        if image_transform is not None:
-            image = image_transform(image)
-        if target_transform is not None:
-            target = target_transform(target)
-        return image, target
-
-    return transform
-
+_HF_OCT_ARCHIVE_NAME = "oct.tar.gz"
 
 def _parse_dataset_str(dataset_str: str):
     tokens = dataset_str.split(":")
@@ -48,7 +35,7 @@ def _parse_dataset_str(dataset_str: str):
         key, value = token.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if key not in ("root", "extra", "split", "hub", "revision", "subdir", "cache_dir"):
+        if key not in ("root", "extra", "split", "hub", "revision", "cache_dir"):
             raise ValueError(f'Unsupported dataset option "{key}" in "{dataset_str}"')
         kwargs[key] = value
 
@@ -77,52 +64,33 @@ def _resolve_oct_dataset_kwargs(kwargs: dict[str, str]) -> dict[str, str]:
 
     if "hub" in kwargs and not prefer_local:
         repo_id = kwargs.pop("hub")
-        # If an (absent) root was supplied as a fallback, it will be overwritten by the Hub snapshot path.
         kwargs.pop("root", None)
 
         revision = kwargs.pop("revision", None) or None
-        subdir = kwargs.pop("subdir", None) or None
         cache_dir = kwargs.pop("cache_dir", None) or None
 
-        try:
-            from huggingface_hub import snapshot_download
-        except ModuleNotFoundError as exc:  # pragma: no cover
-            raise ModuleNotFoundError(
-                'Hugging Face dataset support requires "huggingface-hub". Install with `uv sync --extra hf`.'
-            ) from exc
-
-        snapshot_root = snapshot_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            revision=revision,
-            cache_dir=cache_dir,
+        archive_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=_HF_OCT_ARCHIVE_NAME,
+                repo_type="dataset",
+                revision=revision,
+                cache_dir=cache_dir,
+            )
         )
-        root = Path(snapshot_root)
-        if subdir is not None:
-            root = root / subdir
-        if not root.exists():
-            raise FileNotFoundError(f'Hugging Face dataset path does not exist: "{root}"')
-
-        kwargs["root"] = str(root)
-
+        base = _hf_archive_cache_base(repo_id=repo_id, revision=revision or "main")
+        extracted_root = _extract_hf_archive(archive_path=archive_path, base=base)
+        kwargs["root"] = str(extracted_root)
         if "extra" not in kwargs:
-            # Do not write metadata caches into the HF snapshot; keep them in a separate cache dir.
-            safe_repo = repo_id.replace("/", "__").replace("\\", "__")
-            safe_rev = (revision or "main").replace("/", "__").replace("\\", "__")
-            safe_subdir = (subdir or "").replace("/", "__").replace("\\", "__")
-            base = _DINOCT_CACHE_DIR / "datasets" / "hf" / safe_repo / safe_rev
-            if safe_subdir:
-                base = base / safe_subdir
             kwargs["extra"] = str(base / "extra")
     else:
         if "hub" in kwargs:
-            # Prefer local root if it exists. If both root+hub are provided, ignore hub-specific options.
+            # Prefer local root if it exists.
             kwargs.pop("hub", None)
             kwargs.pop("revision", None)
-            kwargs.pop("subdir", None)
             kwargs.pop("cache_dir", None)
         else:
-            for key in ("revision", "subdir", "cache_dir"):
+            for key in ("revision", "cache_dir"):
                 if key in kwargs:
                     raise ValueError(f'OCT dataset option "{key}=" is only valid when using "hub=".')
 
@@ -138,6 +106,33 @@ def _resolve_oct_dataset_kwargs(kwargs: dict[str, str]) -> dict[str, str]:
         raise ValueError(f"OCT dataset has unsupported options: {sorted(extra_keys)}")
 
     return kwargs
+
+
+def _safe_cache_name(name: str) -> str:
+    return name.replace("/", "__").replace("\\", "__").replace(":", "__")
+
+def _hf_archive_cache_base(*, repo_id: str, revision: str) -> Path:
+    safe_repo = _safe_cache_name(repo_id)
+    safe_rev = _safe_cache_name(revision)
+    return _DINOCT_CACHE_DIR / "datasets" / "hf_archive" / safe_repo / safe_rev
+
+
+def _extract_hf_archive(*, archive_path: Path, base: Path) -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    extracted_dir = base / "extracted"
+    if extracted_dir.is_dir():
+        return extracted_dir
+
+    tmp_dir = base / "extracted.tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    with tarfile.open(archive_path, mode="r:*") as tf:
+        tf.extractall(path=tmp_dir, filter=tarfile.data_filter)
+
+    tmp_dir.rename(extracted_dir)
+    return extracted_dir
 
 
 def make_dataset(
