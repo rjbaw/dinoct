@@ -28,7 +28,7 @@ optim:
 crops:
   local_crops_size: 98
 post_train:
-  steps: 80000
+  steps: 1500
   method: adamw
   sam:
     rho: 0.05

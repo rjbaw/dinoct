@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import math
 from dataclasses import dataclass
@@ -11,29 +12,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
-from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
+
 from ..data import make_dataset
 from ..data.datasets import OCT
 from ..data.transforms import Ensure3CH, MaybeToTensor, PerImageZScore
-import csv
 
 ORIG_H, ORIG_W = 512, 500
 
 
-def pad_to_multiple_hw(x: torch.Tensor, multiple: int) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Pad bottom/right so H,W become multiples of `multiple`."""
+def pad_to_multiple_hw_center(x: torch.Tensor, multiple: int) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
     _, _, H, W = x.shape
     pad_h = (multiple - (H % multiple)) % multiple
     pad_w = (multiple - (W % multiple)) % multiple
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
     if pad_h or pad_w:
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")  # left,right,top,bottom
-    return x, (pad_h, pad_w)
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0)
+    return x, (pad_top, pad_bottom, pad_left, pad_right)
 
 
-# @torch.no_grad()
 def soft_argmax_height(logits_hw: torch.Tensor) -> torch.Tensor:
     """Column-wise softmax over H then soft-argmax → (B, W). Differentiable."""
     _, H, _ = logits_hw.shape
@@ -70,6 +74,34 @@ def curvature_loss_from_logits(logits_hw: torch.Tensor, non_bg_mask: torch.Tenso
     if m.sum() == 0:
         return logits_hw.new_zeros(())
     return (curv_per_sample * m).sum() / (m.sum() + 1e-8)
+
+
+def entropy_weight(curve_logits_y: torch.Tensor) -> torch.Tensor:
+    """Return (B,W) normalized entropy weights in ~[0,1] (detached)."""
+    p = F.softmax(curve_logits_y.float(), dim=1)
+    ent = -(p * torch.log(p + 1e-8)).sum(dim=1)  # (B,W)
+    ent = ent / max(math.log(p.shape[1]), 1e-8)
+    return ent.detach()
+
+
+def robust_curv_loss(curve_logits_y: torch.Tensor, non_bg_mask: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+    """Confidence-weighted (via entropy) robust smoothness over W using a Huber penalty on d2."""
+    y_hat = soft_argmax_height(curve_logits_y.float())  # (B,W)
+    if y_hat.shape[1] < 3:
+        return curve_logits_y.new_zeros(())
+    d2 = y_hat[:, 2:] - 2 * y_hat[:, 1:-1] + y_hat[:, :-2]  # (B,W-2)
+
+    w = entropy_weight(curve_logits_y)[:, 1:-1]  # align to W-2
+
+    absd = d2.abs()
+    delta_f = max(float(delta), 1e-6)
+    huber = torch.where(absd < delta_f, 0.5 * (d2**2) / delta_f, absd - 0.5 * delta_f)
+    per_sample = (w * huber).mean(dim=1)
+
+    m = non_bg_mask.float()
+    if m.sum() == 0:
+        return curve_logits_y.new_zeros(())
+    return (per_sample * m).sum() / (m.sum() + 1e-8)
 
 
 class LoRALinear(nn.Module):
@@ -174,6 +206,20 @@ class CurveHead(nn.Module):
         self.act1 = nn.GELU()
         self.vert2 = nn.Conv2d(mid, mid, kernel_size=(5, 1), padding=(2, 0), groups=mid)
         self.act2 = nn.GELU()
+        self.h_norm = nn.GroupNorm(1, mid)  # stable for small batch
+        self.h_act = nn.GELU()
+        self.horiz1 = nn.Conv2d(
+            mid,
+            mid,
+            kernel_size=(1, 9),
+            padding=(0, 4),
+            groups=mid,
+            padding_mode="replicate",
+            bias=False,
+        )
+        nn.init.zeros_(self.horiz1.weight)  # start as no-op
+        self.h_gamma = nn.Parameter(1e-3 * torch.ones(mid, 1, 1))  # per-channel layer scale
+        self.h_drop = nn.Dropout(p=0.1)  # optional; tune
         self.out_y = nn.Conv2d(mid, 1, kernel_size=1, bias=True)
         self.out_none = nn.Conv2d(mid, 1, kernel_size=1, bias=True)
 
@@ -181,6 +227,9 @@ class CurveHead(nn.Module):
         x = self.proj(tokens_hw)
         x = self.act1(self.vert1(x))
         x = self.act2(self.vert2(x))
+        h = self.horiz1(self.h_act(self.h_norm(x)))
+        gamma = self.h_gamma.to(dtype=h.dtype)
+        x = x + self.h_drop(gamma * h)
 
         H_out, W_out = out_size_hw
 
@@ -201,10 +250,11 @@ class CurveHead(nn.Module):
 @dataclass
 class LossCfg:
     sigma: float = 1.5
-    lambda_bg: float = 0.01
     lambda_curve: float = 1.0
     lambda_curv: float = 0.05
     bg_weight: float = 20.0
+    eps_none: float = 0.02
+    curv_delta: float = 1.0
 
 
 def column_ce_loss_h1w(
@@ -228,43 +278,36 @@ class CurveLoss(nn.Module):
         self.cfg = cfg
 
     def forward(
-        self, presence_logits: torch.Tensor, curve_logits: torch.Tensor, y_curve: torch.Tensor, is_bg: torch.Tensor
+        self, curve_logits: torch.Tensor, y_curve: torch.Tensor, is_bg: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         cfg = self.cfg
         B, H1, W = curve_logits.shape
         H = H1 - 1
-        has_curve = (1 - is_bg).float()
-        non_bg = has_curve
-
-        loss_presence = F.binary_cross_entropy_with_logits(
-            presence_logits,
-            has_curve,
-        )
+        non_bg = (1 - is_bg).float()
 
         with torch.no_grad():
             g = gaussian_targets_from_y(y_curve, H=H, sigma=cfg.sigma)
-            non_bg_ = non_bg.view(B, 1, 1)
-            targets_y = g * non_bg_  # curve imgs: gaussian; bg imgs: 0
-            targets_none = is_bg.float().view(B, 1, 1).expand(B, 1, W)  # bg imgs: 1; curve imgs: 0
+            eps_none = float(cfg.eps_none)
+            targets_none = (is_bg.float().view(B, 1, 1) * 1.0) + ((1 - is_bg).float().view(B, 1, 1) * eps_none)
+            targets_none = targets_none.expand(B, 1, W)
+            targets_y = g * (1.0 - targets_none)  # ensures sum across (H+1) is 1
             targets = torch.cat([targets_y, targets_none], dim=1)
 
         w = torch.ones((B,), device=curve_logits.device, dtype=curve_logits.dtype)
         w = torch.where(is_bg.bool(), w * float(cfg.bg_weight), w)
 
         loss_curve = column_ce_loss_h1w(curve_logits, targets, sample_weight=w)
-        loss_curv = curvature_loss_from_logits(curve_logits[:, :H, :], non_bg_mask=non_bg)
-        total = cfg.lambda_bg * loss_presence + cfg.lambda_curve * loss_curve + cfg.lambda_curv * loss_curv
+        loss_curv = robust_curv_loss(curve_logits[:, :H, :], non_bg_mask=non_bg, delta=float(cfg.curv_delta))
+        total = cfg.lambda_curve * loss_curve + cfg.lambda_curv * loss_curv
         return total, {
-            "loss_presence": loss_presence.detach(),
-            "loss_curve": loss_curve.detach(),
-            "loss_curv": loss_curv.detach(),
+            "loss_col_ce": loss_curve.detach(),
+            "loss_smooth": loss_curv.detach(),
         }
 
 
 def freeze_backbone_except_lora_and_norms(backbone: nn.Module, train_norms: bool = True):
     for p in backbone.parameters():
         p.requires_grad = False
-    # LoRA params are nn.Parameter, so ensure they remain trainable
     for m in backbone.modules():
         if isinstance(m, LoRALinear):
             m.lora_A.requires_grad = True
@@ -297,7 +340,8 @@ class CurveModel(nn.Module):
     def forward(
         self, images_3chw: torch.Tensor, *, orig_hw: tuple[int, int] = (ORIG_H, ORIG_W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        x, _ = pad_to_multiple_hw(images_3chw, self.patch_size)
+        x, pads = pad_to_multiple_hw_center(images_3chw, self.patch_size)
+        pt, _, pl, _ = pads
         H_pad, W_pad = x.shape[-2], x.shape[-1]
         outputs = self.backbone.forward_features(x)
         # cls = outputs[0]["x_norm_clstoken"]
@@ -308,8 +352,8 @@ class CurveModel(nn.Module):
 
         logits_pad = self.curve_head(tokens_hw, (H_pad, W_pad))
         H0, W0 = orig_hw
-        y_logits = logits_pad[:, :H0, :W0]
-        none_logits = logits_pad[:, -1, :W0]
+        y_logits = logits_pad[:, pt : pt + H0, pl : pl + W0]
+        none_logits = logits_pad[:, -1, pl : pl + W0]
         curve_logits = torch.cat([y_logits, none_logits.unsqueeze(1)], dim=1)
         p = F.softmax(curve_logits.float(), dim=1)
         p_none = p[:, -1, :].mean(dim=1).clamp(1e-4, 1 - 1e-4)
@@ -381,7 +425,7 @@ def train_step(
     model: CurveModel,
     criterion: CurveLoss,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler | None,
+    scaler: amp.GradScaler | None,
     *,
     sam_rho: float | None = None,
 ) -> dict[str, float]:
@@ -397,7 +441,7 @@ def train_step(
     if scaler is None:
         with amp.autocast(device_type="cuda", enabled=False):
             presence_logits_1, curve_logits_1 = model(images)
-            loss_1, metrics = criterion(presence_logits_1, curve_logits_1, y, is_bg)
+            loss_1, metrics = criterion(curve_logits_1, y, is_bg)
         loss_1.backward()
 
         loss = loss_1
@@ -406,7 +450,6 @@ def train_step(
         if use_sam:
             rho = float(sam_rho)
             grad_norm = _grad_norm_l2(trainable_params)
-            # Protect against inf/nan grads: SAM perturbation would corrupt weights (e.g., inf * 0 -> nan).
             if torch.isfinite(grad_norm):
                 scale = rho / (grad_norm + 1e-12)
                 eps_list: list[tuple[nn.Parameter, torch.Tensor]] = []
@@ -420,7 +463,7 @@ def train_step(
                 optimizer.zero_grad(set_to_none=True)
                 with amp.autocast(device_type="cuda", enabled=False):
                     presence_logits_2, curve_logits_2 = model(images)
-                    loss_2, _ = criterion(presence_logits_2, curve_logits_2, y, is_bg)
+                    loss_2, _ = criterion(curve_logits_2, y, is_bg)
                 loss_2.backward()
                 with torch.no_grad():
                     for p, e_w in eps_list:
@@ -438,7 +481,7 @@ def train_step(
     else:
         with amp.autocast(device_type="cuda", enabled=True):
             presence_logits_1, curve_logits_1 = model(images)
-            loss_1, metrics = criterion(presence_logits_1, curve_logits_1, y, is_bg)
+            loss_1, metrics = criterion(curve_logits_1, y, is_bg)
         scaler.scale(loss_1).backward()
 
         loss = loss_1
@@ -447,7 +490,6 @@ def train_step(
         if use_sam:
             rho = float(sam_rho)
             grad_norm = _grad_norm_l2(trainable_params)
-            # Guard against non-finite grads: SAM perturbation can introduce NaNs into weights.
             if torch.isfinite(grad_norm):
                 scale = rho / (grad_norm + 1e-12)
                 eps_list: list[tuple[nn.Parameter, torch.Tensor]] = []
@@ -461,7 +503,7 @@ def train_step(
                 optimizer.zero_grad(set_to_none=True)
                 with amp.autocast(device_type="cuda", enabled=True):
                     presence_logits_2, curve_logits_2 = model(images)
-                    loss_2, _ = criterion(presence_logits_2, curve_logits_2, y, is_bg)
+                    loss_2, _ = criterion(curve_logits_2, y, is_bg)
                 scaler.scale(loss_2).backward()
                 with torch.no_grad():
                     for p, e_w in eps_list:
@@ -490,9 +532,8 @@ def validate(
 ) -> dict[str, float]:
     model.eval()
     loss_sum = 0.0
-    loss_presence_sum = 0.0
-    loss_curve_sum = 0.0
-    loss_curv_sum = 0.0
+    loss_col_ce_sum = 0.0
+    loss_smooth_sum = 0.0
     p_curve_sum = 0.0
     n_samples = 0.0
     mae_sum = 0.0
@@ -503,13 +544,12 @@ def validate(
         is_bg = batch["is_bg"].to(device, non_blocking=True).long()
         presence_logits, curve_logits = model(images)
 
-        loss, metrics = criterion(presence_logits, curve_logits, y, is_bg)
+        loss, metrics = criterion(curve_logits, y, is_bg)
         bsz = float(images.shape[0])
         n_samples += bsz
         loss_sum += float(loss.detach().cpu()) * bsz
-        loss_presence_sum += float(metrics.get("loss_presence", torch.tensor(0.0)).detach().cpu()) * bsz
-        loss_curve_sum += float(metrics.get("loss_curve", torch.tensor(0.0)).detach().cpu()) * bsz
-        loss_curv_sum += float(metrics.get("loss_curv", torch.tensor(0.0)).detach().cpu()) * bsz
+        loss_col_ce_sum += float(metrics.get("loss_col_ce", torch.tensor(0.0)).detach().cpu()) * bsz
+        loss_smooth_sum += float(metrics.get("loss_smooth", torch.tensor(0.0)).detach().cpu()) * bsz
         p_curve_sum += float(torch.sigmoid(presence_logits).detach().sum().cpu())
 
         mask = (1 - is_bg).float()
@@ -520,9 +560,8 @@ def validate(
     denom = max(n_samples, 1.0)
     return {
         "val_loss": loss_sum / denom,
-        "val_loss_presence": loss_presence_sum / denom,
-        "val_loss_curve": loss_curve_sum / denom,
-        "val_loss_curv": loss_curv_sum / denom,
+        "val_loss_col_ce": loss_col_ce_sum / denom,
+        "val_loss_smooth": loss_smooth_sum / denom,
         "val_p_curve": p_curve_sum / denom,
         "val_mae_px": (mae_sum / max(mae_cnt, 1.0)) if mae_cnt > 0 else float("nan"),
     }
@@ -541,10 +580,13 @@ def run_post_training(
     wd_head: float,
     lr_lora: float,
     wd_lora: float,
+    lr_warmup: int = 50,
+    min_lr_mult: float = 0.1,
     sigma: float,
-    lambda_bg: float,
     lambda_curve: float,
     lambda_curv: float,
+    eps_none: float = 0.02,
+    curv_delta: float = 1.0,
     lora_blocks: int,
     lora_r: int,
     lora_alpha: int,
@@ -560,8 +602,17 @@ def run_post_training(
     metrics_path = best_path.parent / "metrics.csv"
     metrics_fh = metrics_path.open("a", newline="")
     metrics_writer = csv.writer(metrics_fh)
+    header = ["step", "loss", "mae_px", "loss_col_ce", "loss_smooth", "p_curve", "lr_head", "lr_lora"]
     if metrics_path.stat().st_size == 0:
-        metrics_writer.writerow(["step", "loss", "mae_px", "loss_presence", "loss_curve", "loss_curv", "p_curve"])
+        metrics_writer.writerow(header)
+    else:
+        try:
+            with metrics_path.open("r", newline="") as fh:
+                first = fh.readline().strip()
+            if first != ",".join(header):
+                metrics_writer.writerow(header)
+        except Exception:
+            pass
 
     ds_full = make_dataset(dataset_str=dataset_str, transform=_make_oct_transform())
     if not isinstance(ds_full, OCT):
@@ -631,12 +682,34 @@ def run_post_training(
     criterion = CurveLoss(
         LossCfg(
             sigma=sigma,
-            lambda_bg=lambda_bg,
             lambda_curve=lambda_curve,
             lambda_curv=lambda_curv,
+            eps_none=eps_none,
+            curv_delta=curv_delta,
         )
     )
     opt = build_optimizer(model, lr_head=lr_head, wd_head=wd_head, lr_lora=lr_lora, wd_lora=wd_lora)
+
+    warmup_steps = min(max(int(lr_warmup), 0), max(int(steps), 1))
+    min_lr_mult_f = float(min_lr_mult)
+
+    def lr_mult_for_step(step_num: int) -> float:
+        step_num = max(int(step_num), 1)
+        if warmup_steps > 0 and step_num <= warmup_steps:
+            return step_num / warmup_steps
+        t = (step_num - warmup_steps) / max(1, int(steps) - warmup_steps)
+        return min_lr_mult_f + (1.0 - min_lr_mult_f) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+    lr_mult_1 = float(lr_mult_for_step(1))
+    if not math.isfinite(lr_mult_1) or lr_mult_1 <= 0:
+        lr_mult_1 = 1.0
+    for pg in opt.param_groups:
+        pg["lr"] = float(pg.get("lr", 0.0)) * lr_mult_1
+    scheduler = (
+        torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda step: lr_mult_for_step(step + 2) / lr_mult_1)
+        if int(steps) > 1
+        else None
+    )
     scaler = amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -647,33 +720,44 @@ def run_post_training(
     while seen < steps:
         for batch in dl:
             method_l = str(method).lower()
-            if method_l in {"adamw", "erm"}:
+            if method_l == "adamw":
                 sam = None
             elif method_l == "sam":
                 sam = float(sam_rho)
             else:
                 raise ValueError(f"Unknown post_train.method={method!r} (expected 'adamw' or 'sam').")
 
+            lr_head_cur = float(opt.param_groups[0].get("lr", 0.0)) if opt.param_groups else 0.0
+            lr_lora_cur = (
+                float(opt.param_groups[1].get("lr", lr_head_cur)) if len(opt.param_groups) > 1 else lr_head_cur
+            )
             stats = train_step(batch, model, criterion, opt, scaler=scaler, sam_rho=sam)
             seen += 1
+            stats["lr_head"] = lr_head_cur
+            stats["lr_lora"] = lr_lora_cur
+
+            if scheduler is not None and seen < steps:
+                scheduler.step()
 
             if seen % log_every == 0 or seen == 1:
                 print(
                     f"[post {seen}/{steps}] loss={stats.get('loss', 0):.4f} "
                     f"mae_px={stats.get('mae_px', 0):.2f} "
-                    f"Lp={stats.get('loss_presence', 0):.4f} "
-                    f"Lcurve={stats.get('loss_curve', 0):.4f} "
-                    f"Lcurv={stats.get('loss_curv', 0):.4f}"
+                    f"Lcol={stats.get('loss_col_ce', 0):.4f} "
+                    f"Lsmooth={stats.get('loss_smooth', 0):.4f} "
+                    f"lrh={stats.get('lr_head', 0):.2e} "
+                    f"lrl={stats.get('lr_lora', 0):.2e}"
                 )
                 metrics_writer.writerow(
                     [
                         seen,
                         stats.get("loss", 0.0),
                         stats.get("mae_px", 0.0),
-                        stats.get("loss_presence", 0.0),
-                        stats.get("loss_curve", 0.0),
-                        stats.get("loss_curv", 0.0),
+                        stats.get("loss_col_ce", 0.0),
+                        stats.get("loss_smooth", 0.0),
                         stats.get("p_curve", 0.0),
+                        stats.get("lr_head", 0.0),
+                        stats.get("lr_lora", 0.0),
                     ]
                 )
                 metrics_fh.flush()

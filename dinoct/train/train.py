@@ -619,6 +619,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--post-train-lr-lora", type=float, default=None)
     parser.add_argument("--post-train-wd-head", type=float, default=None)
     parser.add_argument("--post-train-wd-lora", type=float, default=None)
+    parser.add_argument(
+        "--post-train-lr-warmup",
+        type=int,
+        default=None,
+        help="Warmup steps for post-train LR schedule",
+    )
+    parser.add_argument(
+        "--post-train-min-lr-mult",
+        type=float,
+        default=None,
+        help="Final LR multiplier for post-train cosine decay (e.g. 0.1)",
+    )
     parser.add_argument("--post-train-sigma", type=float, default=None)
     parser.add_argument("--post-train-lambda-bg", type=float, default=None)
     parser.add_argument("--post-train-lambda-curve", type=float, default=None)
@@ -714,10 +726,13 @@ def main() -> None:
             wd_head=float(args.post_train_wd_head or post_cfg.get("wd_head", 5e-4)),
             lr_lora=float(args.post_train_lr_lora or post_cfg.get("lr_lora", 5e-4)),
             wd_lora=float(args.post_train_wd_lora or post_cfg.get("wd_lora", 0.0)),
+            lr_warmup=int(args.post_train_lr_warmup or post_cfg.get("lr_warmup", 50)),
+            min_lr_mult=float(args.post_train_min_lr_mult or post_cfg.get("min_lr_mult", 0.1)),
             sigma=float(args.post_train_sigma or post_cfg.get("sigma", 1.5)),
-            lambda_bg=float(args.post_train_lambda_bg or post_cfg.get("lambda_bg", 1.0)),
             lambda_curve=float(args.post_train_lambda_curve or post_cfg.get("lambda_curve", 1.0)),
             lambda_curv=float(args.post_train_lambda_curv or post_cfg.get("lambda_curv", 0.05)),
+            eps_none=float(post_cfg.get("eps_none", 0.02)),
+            curv_delta=float(post_cfg.get("curv_delta", 1.0)),
             lora_blocks=int(args.post_train_lora_blocks or post_cfg.get("lora_blocks", 3)),
             lora_r=int(args.post_train_lora_r or post_cfg.get("lora_r", 8)),
             lora_alpha=int(args.post_train_lora_alpha or post_cfg.get("lora_alpha", 16)),
