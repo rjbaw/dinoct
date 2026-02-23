@@ -629,7 +629,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--post-train-min-lr-mult",
         type=float,
         default=None,
-        help="Final LR multiplier for post-train cosine decay (e.g. 0.1)",
+        help="Final LR multiplier for post-train cosine decay",
+    )
+    parser.add_argument(
+        "--post-train-ema-decay",
+        type=float,
+        default=None,
+        help="EMA decay",
     )
     parser.add_argument("--post-train-sigma", type=float, default=None)
     parser.add_argument("--post-train-lambda-bg", type=float, default=None)
@@ -714,6 +720,21 @@ def main() -> None:
         if not isinstance(sam_cfg, dict):
             sam_cfg = {}
         sam_rho = sam_cfg.get("rho", post_cfg.get("sam_rho", 0.05))
+        post_lr_warmup = (
+            args.post_train_lr_warmup
+            if args.post_train_lr_warmup is not None
+            else post_cfg.get("lr_warmup", 50)
+        )
+        post_min_lr_mult = (
+            args.post_train_min_lr_mult
+            if args.post_train_min_lr_mult is not None
+            else post_cfg.get("min_lr_mult", 0.1)
+        )
+        post_ema_decay = (
+            args.post_train_ema_decay
+            if args.post_train_ema_decay is not None
+            else post_cfg.get("ema_decay", 0.0)
+        )
         run_post_training(
             backbone=backbone,
             patch_size=int(get_cfg(cfg, ("student", "patch_size"), 14)),
@@ -726,8 +747,9 @@ def main() -> None:
             wd_head=float(args.post_train_wd_head or post_cfg.get("wd_head", 5e-4)),
             lr_lora=float(args.post_train_lr_lora or post_cfg.get("lr_lora", 5e-4)),
             wd_lora=float(args.post_train_wd_lora or post_cfg.get("wd_lora", 0.0)),
-            lr_warmup=int(args.post_train_lr_warmup or post_cfg.get("lr_warmup", 50)),
-            min_lr_mult=float(args.post_train_min_lr_mult or post_cfg.get("min_lr_mult", 0.1)),
+            lr_warmup=int(post_lr_warmup),
+            min_lr_mult=float(post_min_lr_mult),
+            ema_decay=float(post_ema_decay),
             sigma=float(args.post_train_sigma or post_cfg.get("sigma", 1.5)),
             lambda_curve=float(args.post_train_lambda_curve or post_cfg.get("lambda_curve", 1.0)),
             lambda_curv=float(args.post_train_lambda_curv or post_cfg.get("lambda_curv", 0.05)),

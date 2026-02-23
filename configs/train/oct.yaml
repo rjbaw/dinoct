@@ -36,11 +36,15 @@ post_train:
   lr_head: 5.0e-04
   lr_lora: 1.0e-04
   wd_head: 5.0e-04
-  wd_lora: 0.0
-  sigma: 1.5
-  lambda_bg: 1.0
+  wd_lora: 1.0e-04
+  lr_warmup: 50
+  min_lr_mult: 0.3
+  ema_decay: 0.995
+  sigma: 2.0
   lambda_curve: 1.0
   lambda_curv: 0.05
+  eps_none: 0.02
+  curv_delta: 1.0
   lora_blocks: 3
   lora_r: 8
   lora_alpha: 16

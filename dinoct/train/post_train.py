@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import math
 from dataclasses import dataclass
@@ -102,6 +103,22 @@ def robust_curv_loss(curve_logits_y: torch.Tensor, non_bg_mask: torch.Tensor, de
     if m.sum() == 0:
         return curve_logits_y.new_zeros(())
     return (per_sample * m).sum() / (m.sum() + 1e-8)
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.995):
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for ema_p, p in zip(self.ema.parameters(), model.parameters()):
+            ema_p.mul_(d).add_(p.detach(), alpha=1.0 - d)
+        for ema_b, b in zip(self.ema.buffers(), model.buffers()):
+            ema_b.copy_(b)
 
 
 class LoRALinear(nn.Module):
@@ -252,7 +269,7 @@ class LossCfg:
     sigma: float = 1.5
     lambda_curve: float = 1.0
     lambda_curv: float = 0.05
-    bg_weight: float = 20.0
+    bg_weight: float = 5.0
     eps_none: float = 0.02
     curv_delta: float = 1.0
 
@@ -582,6 +599,7 @@ def run_post_training(
     wd_lora: float,
     lr_warmup: int = 50,
     min_lr_mult: float = 0.1,
+    ema_decay: float = 0.0,
     sigma: float,
     lambda_curve: float,
     lambda_curv: float,
@@ -665,9 +683,6 @@ def run_post_training(
         collate_fn=_collate_oct,
     )
 
-    num_bg = int((entries["code"] == 2).sum())
-    num_curve = int((entries["code"] == 1).sum())
-
     model = CurveModel(
         backbone,
         patch_size=patch_size,
@@ -679,6 +694,10 @@ def run_post_training(
             "use_mlp": lora_use_mlp,
         },
     ).to(device)
+    ema: ModelEMA | None = None
+    ema_decay_f = float(ema_decay)
+    if 0.0 < ema_decay_f < 1.0:
+        ema = ModelEMA(model, decay=ema_decay_f)
     criterion = CurveLoss(
         LossCfg(
             sigma=sigma,
@@ -705,6 +724,7 @@ def run_post_training(
         lr_mult_1 = 1.0
     for pg in opt.param_groups:
         pg["lr"] = float(pg.get("lr", 0.0)) * lr_mult_1
+
     scheduler = (
         torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda step: lr_mult_for_step(step + 2) / lr_mult_1)
         if int(steps) > 1
@@ -733,6 +753,11 @@ def run_post_training(
             )
             stats = train_step(batch, model, criterion, opt, scaler=scaler, sam_rho=sam)
             seen += 1
+            if ema is not None and seen >= warmup_steps:
+                if seen == warmup_steps:
+                    ema.ema.load_state_dict(model.state_dict(), strict=True)
+                elif seen > warmup_steps:
+                    ema.update(model)
             stats["lr_head"] = lr_head_cur
             stats["lr_lora"] = lr_lora_cur
 
@@ -764,12 +789,33 @@ def run_post_training(
             cur_mae = float(stats.get("mae_px", float("inf")))
             if cur_mae < best_mae:
                 best_mae = cur_mae
-                torch.save({"model": model.state_dict()}, best_path)
+                if ema is None or seen < warmup_steps:
+                    torch.save({"model": model.state_dict()}, best_path)
+                else:
+                    torch.save(
+                        {
+                            "model": ema.ema.state_dict(),
+                            "raw_model": model.state_dict(),
+                            "ema_decay": float(ema.decay),
+                        },
+                        best_path,
+                    )
             if seen >= steps:
                 break
 
-    torch.save({"model": model.state_dict()}, output_path)
-    vm_final = validate(model, dl_val, device, criterion)
+    if ema is None:
+        torch.save({"model": model.state_dict()}, output_path)
+    else:
+        torch.save(
+            {
+                "model": ema.ema.state_dict(),
+                "raw_model": model.state_dict(),
+                "ema_decay": float(ema.decay),
+            },
+            output_path,
+        )
+    eval_model = ema.ema if ema is not None else model
+    vm_final = validate(eval_model, dl_val, device, criterion)
     vm_best: dict[str, float] | None = None
     if best_path.exists():
         sd_final = {k: v.detach().cpu() for k, v in model.state_dict().items()}
