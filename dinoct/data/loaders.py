@@ -56,9 +56,6 @@ def _resolve_oct_dataset_kwargs(kwargs: dict[str, str]) -> dict[str, str]:
       - Local paths: OCT:root=/path/to/oct[:extra=/path/to/extra]
       - Hugging Face Hub dataset repo: OCT:hub=<user/dataset>[:revision=...][:subdir=...][:cache_dir=...][:extra=...]
     """
-    if "split" in kwargs:
-        raise ValueError('OCT dataset does not support "split=". Remove it from the dataset string.')
-
     root = kwargs.get("root")
     prefer_local = root is not None and Path(root).exists()
 
@@ -101,7 +98,7 @@ def _resolve_oct_dataset_kwargs(kwargs: dict[str, str]) -> dict[str, str]:
     if "extra" not in kwargs:
         kwargs["extra"] = str(Path(kwargs["root"]) / "extra")
 
-    extra_keys = set(kwargs) - {"root", "extra"}
+    extra_keys = set(kwargs) - {"root", "extra", "split"}
     if extra_keys:
         raise ValueError(f"OCT dataset has unsupported options: {sorted(extra_keys)}")
 

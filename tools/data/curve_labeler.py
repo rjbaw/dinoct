@@ -19,8 +19,8 @@ Assumptions
 - Image coordinate system: origin at top-left, y increases downward (matches PIL/imshow upper origin).
 
 Usage
-  python scripts/data/curve_labeler.py --dir data/oct
-  python scripts/data/curve_labeler.py --dir data/oct --pattern "*_skin.txt"  # optional subset
+  python tools/data/curve_labeler.py --dir data/oct
+  python tools/data/curve_labeler.py --dir data/oct --pattern "*_skin.txt"  # optional subset
 
 Keys
 - left/right: move selected x index by 1 (no Shift/Ctrl acceleration).

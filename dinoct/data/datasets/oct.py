@@ -1,10 +1,12 @@
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 
 from .extended import ExtendedVisionDataset
+from ...oct_metadata import read_manifest_csv, read_splits_csv
 
 
 logger = logging.getLogger("dinoct")
@@ -21,12 +23,14 @@ class OCT(ExtendedVisionDataset):
         # split: "",
         root: str,
         extra: str,
+        split: str | None = None,
         transforms: Callable | None = None,
         transform: Callable | None = None,
         target_transform: Callable | None = None,
     ) -> None:
         super().__init__(root, transforms, transform, target_transform)
         self._extra_root = extra
+        self._split = split.strip().lower() if split else None
         # self._split = split
 
         # self._entries = Optional[np.ndarray] = None
@@ -55,6 +59,8 @@ class OCT(ExtendedVisionDataset):
 
     @property
     def _entries_path(self) -> str:
+        if self._split:
+            return f"entries_{self._split}.npy"
         return "entries.npy"
 
     def _get_entries(self) -> np.ndarray:
@@ -101,8 +107,14 @@ class OCT(ExtendedVisionDataset):
             return np.zeros(VECTOR_LENGTH, dtype=np.float32)
 
         if code == 1:
-            base_name, _ = os.path.splitext(os.path.basename(entry["filename"]))
-            txt_path = os.path.join(self.root, "labeled", base_name + ".txt")
+            label_relpath = ""
+            if "label_relpath" in entry.dtype.names:
+                label_relpath = str(entry["label_relpath"])
+            if label_relpath:
+                txt_path = os.path.join(self.root, label_relpath)
+            else:
+                base_name, _ = os.path.splitext(os.path.basename(entry["filename"]))
+                txt_path = os.path.join(self.root, "labeled", base_name + ".txt")
             return self._load_label_vector(txt_path)
 
         return None
@@ -115,6 +127,11 @@ class OCT(ExtendedVisionDataset):
         return len(entries)
 
     def _dump_entries(self) -> None:
+        manifest_path = Path(self._get_extra_full_path("manifest.csv"))
+        if manifest_path.exists():
+            self._dump_entries_from_manifest(manifest_path)
+            return
+
         raw_dir = os.path.join(self.root, "raw")
         labeled_dir = os.path.join(self.root, "labeled")
         background_dir = os.path.join(self.root, "background")
@@ -157,6 +174,62 @@ class OCT(ExtendedVisionDataset):
                 code = 1 if os.path.exists(txt_path) else 0
 
             entries_array[idx] = (rel_path, code)
+
+        logger.info(f'saving entries to "{self._entries_path}"')
+        self._save_extra(entries_array, self._entries_path)
+
+    def _dump_entries_from_manifest(self, manifest_path: Path) -> None:
+        rows = read_manifest_csv(manifest_path)
+        split_map: dict[str, str] = {}
+        splits_path = Path(self._get_extra_full_path("splits.csv"))
+        if splits_path.exists():
+            split_map = {key: value.lower() for key, value in read_splits_csv(splits_path).items()}
+
+        dtype = np.dtype(
+            [
+                ("filename", "U512"),
+                ("code", "<u1"),
+                ("label_relpath", "U512"),
+                ("background_relpath", "U512"),
+                ("group_id", "U128"),
+                ("family_id", "U128"),
+                ("variant", "U128"),
+                ("modality", "U128"),
+                ("sample_id", "U512"),
+                ("kind", "U32"),
+                ("split", "U16"),
+            ]
+        )
+
+        filtered: list[tuple[str, int, str, str, str, str, str, str, str, str, str]] = []
+        for row in rows:
+            row_split = split_map.get(row.group_id, "")
+            if self._split and row_split != self._split:
+                continue
+            filtered.append(
+                (
+                    row.image_relpath,
+                    int(row.code),
+                    row.label_relpath,
+                    row.paired_background_relpath,
+                    row.group_id,
+                    row.family_id,
+                    row.variant,
+                    row.modality,
+                    row.sample_id,
+                    row.kind,
+                    row_split,
+                )
+            )
+
+        if self._split and not filtered:
+            raise FileNotFoundError(
+                f"No OCT samples matched split={self._split!r} using manifest {manifest_path}."
+            )
+
+        entries_array = np.empty(len(filtered), dtype=dtype)
+        for idx, item in enumerate(filtered):
+            entries_array[idx] = item
 
         logger.info(f'saving entries to "{self._entries_path}"')
         self._save_extra(entries_array, self._entries_path)
