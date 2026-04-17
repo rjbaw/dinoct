@@ -1,15 +1,19 @@
 dino:
-  head_n_prototypes: 131072
-  head_bottleneck_dim: 384
+  head_n_prototypes: 16384
+  head_bottleneck_dim: 256
+  head_hidden_dim: 2048
 ibot:
-  separate_head: true
-  head_n_prototypes: 131072
+  separate_head: false
+  head_n_prototypes: 16384
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
 train:
   dataset_path: OCT:root=data/oct:hub=rjbaw/oct
   batch_size_per_gpu: 32
+  OFFICIAL_EPOCH_LENGTH: 1250
   centering: sinkhorn_knopp
   mp_start_method: spawn
-  OFFICIAL_EPOCH_LENGTH: 500
 student:
   arch: convnext_tiny
   patch_size: 14
@@ -19,28 +23,28 @@ student:
 teacher:
   momentum_teacher: 0.994
 optim:
-  epochs: 1000
+  epochs: 500
+  weight_decay: 0.04
   weight_decay_end: 0.2
-  base_lr: 2.0e-04  # learning rate for a batch size of 1024
-  #base_lr: 2.0e-08  # learning rate for a batch size of 1024
+  base_lr: 2.0e-04
   warmup_epochs: 80
+  min_lr: 1.0e-06
   layerwise_decay: 1.0
 crops:
   local_crops_size: 98
 post_train:
   steps: 1500
-  method: adamw
-  sam:
-    rho: 0.05
+  method: sam
   batch_size: 256
   lr_head: 5.0e-04
   lr_lora: 1.0e-04
-  wd_head: 5.0e-04
-  wd_lora: 1.0e-04
-  lr_warmup: 50
-  min_lr_mult: 0.3
-  ema_decay: 0.995
-  sigma: 2.0
+  wd_head: 1.0e-03
+  wd_lora: 5.0e-05
+  lr_warmup: 0
+  val_every: 1
+  min_lr_mult: 1.0
+  ema_decay: 0.99
+  sigma: 1.5
   lambda_curve: 1.0
   lambda_curv: 0.05
   eps_none: 0.02
@@ -48,5 +52,7 @@ post_train:
   lora_blocks: 3
   lora_r: 8
   lora_alpha: 16
-  lora_dropout: 0.05
+  lora_dropout: 0.02
   lora_use_mlp: false
+  sam:
+    rho: 0.05

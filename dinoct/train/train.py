@@ -10,8 +10,10 @@ from typing import Any
 import torch
 from torch import amp, nn, optim
 import yaml
+from torch.utils.data import Subset
 
 from ..data import DataAugmentationDINO, MaskingGenerator, collate_data_and_cast, make_data_loader, make_dataset
+from ..data.datasets import OCT
 from ..layers import DINOHead
 from ..loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
 from ..models import build_backbone
@@ -25,6 +27,22 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "ssl_default_config.yaml"
 DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs" / "train" / "oct.yaml"
 
 logger = logging.getLogger("dinoct")
+
+
+def _parse_dataset_path(dataset_str: str) -> tuple[str, dict[str, str]]:
+    parts = dataset_str.split(":")
+    tokens: dict[str, str] = {}
+    for token in parts[1:]:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        tokens[key] = value
+    return parts[0], tokens
+
+
+def _format_dataset_path(name: str, tokens: dict[str, str]) -> str:
+    rebuilt = [name] + [f"{key}={value}" for key, value in tokens.items()]
+    return ":".join(rebuilt)
 
 
 def deep_update(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -62,12 +80,7 @@ def resolve_dataset_path(dataset_str: str) -> str:
     """
     Best-effort resolution so relative OCT paths work when launched from repo root.
     """
-    parts = dataset_str.split(":")
-    tokens: dict[str, str] = {}
-    for token in parts[1:]:
-        if "=" in token:
-            k, v = token.split("=", 1)
-            tokens[k] = v
+    name, tokens = _parse_dataset_path(dataset_str)
     for key in ("root", "extra"):
         if key in tokens:
             path = Path(tokens[key])
@@ -81,8 +94,19 @@ def resolve_dataset_path(dataset_str: str) -> str:
                     if cand.exists():
                         tokens[key] = str(cand.resolve())
                         break
-    rebuilt = [parts[0]] + [f"{k}={v}" for k, v in tokens.items()]
-    return ":".join(rebuilt) if tokens else dataset_str
+    return _format_dataset_path(name, tokens) if tokens else dataset_str
+
+
+def ssl_split_path(dataset_str: str) -> Path | None:
+    name, tokens = _parse_dataset_path(dataset_str)
+    if name.upper() != "OCT" or "root" not in tokens:
+        return None
+    root = Path(tokens["root"])
+    extra = Path(tokens.get("extra", str(root / "extra")))
+    splits_path = extra / "splits.csv"
+    if not splits_path.exists():
+        return None
+    return splits_path
 
 
 def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, int]:
@@ -93,6 +117,7 @@ def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, 
     dataset_str = resolve_dataset_path(
         str(get_cfg(cfg, ("train", "dataset_path"), "OCT:root=data/oct:extra=data/oct/extra"))
     )
+    splits_path = ssl_split_path(dataset_str)
 
     augment = DataAugmentationDINO(
         get_cfg(cfg, ("crops", "global_crops_scale"), (0.32, 1.0)),
@@ -120,6 +145,25 @@ def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, 
     )
 
     dataset = make_dataset(dataset_str=dataset_str, transform=augment, target_transform=lambda _: ())
+    if isinstance(dataset, OCT) and splits_path is not None:
+        entries = dataset._get_entries()
+        keep_idx = [
+            idx
+            for idx, entry in enumerate(entries)
+            if int(entry["code"]) == 2 or str(entry["split"]).lower() == "train"
+        ]
+        logger.info("using OCT train raws plus all backgrounds for SSL because %s exists", splits_path)
+        logger.info(
+            "effective SSL subset after split filtering: %d / %d samples",
+            len(keep_idx),
+            len(entries),
+        )
+        dataset = Subset(dataset, keep_idx)
+    else:
+        try:
+            logger.info("effective SSL dataset size without split filtering: %d samples", len(dataset))
+        except TypeError:
+            pass
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=int(get_cfg(cfg, ("train", "batch_size_per_gpu"), 8)),
@@ -609,7 +653,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default="outputs", help="Override output directory")
     parser.add_argument("--steps", type=int, default=None, help="Override total iteration count")
     parser.add_argument("--batch-size", type=int, default=None, help="Override per-GPU batch size")
-    parser.add_argument("--seed", type=int, default=None, help="Override random seed")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override data loader workers")
+    parser.add_argument("--seed", type=int, default=0, help="Global random seed for SSL and post-train")
     # Post-train (curve) stage
     parser.add_argument(
         "--post-train-steps", type=int, default=None, help="Run curve post-training for N steps (0 to skip)"
@@ -647,6 +692,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--post-train-lora-dropout", type=float, default=None)
     parser.add_argument("--post-train-lora-use-mlp", action="store_true")
     parser.add_argument(
+        "--post-train-method",
+        choices=["sam", "adamw"],
+        default=None,
+        help="Override post-train optimizer method",
+    )
+    parser.add_argument(
         "--post-train-only",
         action="store_true",
         help="Skip SSL pretrain; load --pretrained-backbone and post-train only",
@@ -664,9 +715,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args()
     cfg = load_training_cfg(args.config)
+    effective_seed = int(args.seed)
+    cfg.setdefault("train", {})["seed"] = effective_seed
+    fix_random_seeds(effective_seed)
     post_cfg = cfg.get("post_train", {})
     if args.batch_size is not None:
         cfg.setdefault("train", {})["batch_size_per_gpu"] = args.batch_size
+    if args.num_workers is not None:
+        cfg.setdefault("train", {})["num_workers"] = args.num_workers
     if args.output_dir is not None:
         cfg.setdefault("train", {})["output_dir"] = str(args.output_dir)
     # Optional SSL pretrain
@@ -687,7 +743,7 @@ def main() -> None:
             )
 
     if not args.post_train_only:
-        train(cfg, steps_override=args.steps, output_dir_override=output_dir, seed_override=args.seed)
+        train(cfg, steps_override=args.steps, output_dir_override=output_dir, seed_override=effective_seed)
     if post_steps and post_steps > 0:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for curve post-training.")
@@ -739,7 +795,7 @@ def main() -> None:
             backbone=backbone,
             patch_size=int(get_cfg(cfg, ("student", "patch_size"), 14)),
             dataset_str=resolved_ds,
-            seed=int(get_cfg(cfg, ("train", "seed"), 0)),
+            seed=effective_seed,
             steps=int(post_steps),
             batch_size=int(args.post_train_batch_size or post_cfg.get("batch_size", 128)),
             num_workers=int(get_cfg(cfg, ("train", "num_workers"), 4)),
@@ -760,9 +816,10 @@ def main() -> None:
             lora_alpha=int(args.post_train_lora_alpha or post_cfg.get("lora_alpha", 16)),
             lora_dropout=float(args.post_train_lora_dropout or post_cfg.get("lora_dropout", 0.05)),
             lora_use_mlp=bool(args.post_train_lora_use_mlp or post_cfg.get("lora_use_mlp", False)),
-            method=str(post_cfg.get("method", "sam")),
+            method=str(args.post_train_method or post_cfg.get("method", "sam")),
             sam_rho=float(sam_rho),
             log_every=int(get_cfg(cfg, ("train", "log_every"), 10)),
+            val_every=int(post_cfg.get("val_every", 1)),
             device=device,
             output_path=post_out,
             best_path=best_out,

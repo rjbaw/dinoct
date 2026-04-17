@@ -12,7 +12,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _find_repo_root() -> Path:
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "pyproject.toml").exists() and (candidate / "dinoct").is_dir():
+            return candidate
+    raise RuntimeError("Could not locate repo root from script path.")
+
+
+REPO_ROOT = _find_repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -23,12 +31,15 @@ log = logging.getLogger("export")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-def pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # pragma: no cover
-        return torch.device("mps")
-    return torch.device("cpu")
+def pick_device(device_arg: str = "auto") -> torch.device:
+    want = str(device_arg).strip().lower()
+    if want == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # pragma: no cover
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(want)
 
 
 @torch.no_grad()
@@ -59,9 +70,9 @@ class ExportWrapper(nn.Module):
         self.model = model
 
     def forward(self, x: torch.Tensor):
-        presence_logits, curve_logits = self.model(x)  # curve_logits: (B, H+1, W)
-        y_logits = curve_logits[:, :-1, :]  # (B, H, W)
-        y_vec = soft_argmax_height_jit_safe(y_logits)  # (B, W)
+        presence_logits, curve_logits = self.model(x)
+        y_logits = curve_logits[:, :-1, :]
+        y_vec = soft_argmax_height_jit_safe(y_logits)
         return presence_logits, y_vec
 
 
@@ -99,7 +110,7 @@ def build_model(backbone_name: str, model_path: str, device: torch.device) -> Cu
     if not (model_path and os.path.exists(model_path)):
         raise FileNotFoundError(f"Fused model checkpoint not found: {model_path}")
 
-    log.info(f"Loading fused curve model: {model_path}")
+    log.info(f"Loading fused DINOCT curve model: {model_path}")
     sd = torch.load(model_path, map_location="cpu")
     sd = sd.get("model", sd)
 
@@ -110,7 +121,9 @@ def build_model(backbone_name: str, model_path: str, device: torch.device) -> Cu
     arch = backbone_name.replace("vit_", "") if backbone_name.startswith("vit_") else backbone_name
     backbone = build_backbone(arch, patch_size=14)
     model = CurveModel(
-        backbone=backbone, patch_size=14, lora_cfg={"blocks": 3, "r": 8, "alpha": 16, "dropout": 0.05, "use_mlp": False}
+        backbone=backbone,
+        patch_size=14,
+        lora_cfg={"blocks": 3, "r": 8, "alpha": 16, "dropout": 0.05, "use_mlp": False},
     )
     model.eval()
 
@@ -123,7 +136,6 @@ def build_model(backbone_name: str, model_path: str, device: torch.device) -> Cu
         ) from exc
 
     model = model.to(device=device, dtype=torch.float32)
-    # Force rope to fp32 to avoid bfloat16 in ONNX
     if hasattr(model.backbone, "rope_embed"):
         try:
             model.backbone.rope_embed.dtype = torch.float32
@@ -155,7 +167,7 @@ def verify(eager, traced, x, tag="TS vs Eager"):
 
 
 def main():
-    ap = argparse.ArgumentParser("Export CurveModel (LoRA-fused) to TorchScript/ONNX")
+    ap = argparse.ArgumentParser("Export DINOCT CurveModel (LoRA-fused) to TorchScript/ONNX")
     ap.add_argument("--backbone", choices=["auto", "small", "convnext_tiny", "convnext_small"], default="auto")
     ap.add_argument(
         "--model",
@@ -166,10 +178,11 @@ def main():
     ap.add_argument("--opset", type=int, default=18)
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--static", action="store_true", help="Export static batch=1 (no dynamic axes)")
+    ap.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
-    device = pick_device()
+    device = pick_device(args.device)
     log.info(f"Using device: {device}")
 
     model = build_model(args.backbone, args.model, device)
@@ -213,8 +226,8 @@ def main():
             if "onnxscript" not in str(exc):
                 raise
             log.warning("onnxscript missing; falling back to legacy exporter.")
-            from torch.onnx import utils as onnx_utils
             from torch.onnx import OperatorExportTypes, TrainingMode
+            from torch.onnx import utils as onnx_utils
 
             onnx_utils._export(
                 wrapped,
@@ -230,7 +243,6 @@ def main():
                 keep_initializers_as_inputs=False,
             )
 
-    # If exporter wrote external data, merge into single file for easier distribution
     data_path = onnx_path.with_suffix(onnx_path.suffix + ".data")
     if data_path.exists():
         try:

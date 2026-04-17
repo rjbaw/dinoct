@@ -14,14 +14,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
+from torchvision.transforms import functional as tvf
 from torchvision.transforms import InterpolationMode
 
 from ..data import make_dataset
 from ..data.datasets import OCT
 from ..data.transforms import Ensure3CH, MaybeToTensor, PerImageZScore
-from ..eval import DEFAULT_ACC_TOLERANCES, curve_metrics_batch, metric_name_for_tolerance
+from ..eval import DEFAULT_ACC_TOLERANCES, curve_metrics_batch, estimate_spike_kappa_from_curves, metric_name_for_tolerance
 from ..utils import fix_random_seeds
 
 ORIG_H, ORIG_W = 512, 500
@@ -125,6 +126,283 @@ class ModelEMA:
             ema_b.copy_(b)
 
 
+@dataclass(frozen=True)
+class PostTrainAugmentConfig:
+    hflip_prob: float = 0.0
+    hshift_max: int = 0
+    vshift_max: int = 0
+    gamma_prob: float = 0.0
+    gamma_min: float = 1.0
+    gamma_max: float = 1.0
+    contrast_prob: float = 0.0
+    contrast_min: float = 1.0
+    contrast_max: float = 1.0
+    blur_prob: float = 0.0
+    blur_sigma_min: float = 0.0
+    blur_sigma_max: float = 0.0
+    noise_prob: float = 0.0
+    noise_std_max: float = 0.0
+    occlusion_prob: float = 0.0
+    occlusion_count_min: int = 1
+    occlusion_count_max: int = 1
+    occlusion_width_min: int = 0
+    occlusion_width_max: int = 0
+    occlusion_noise_std: float = 0.0
+    occlusion_alpha_min: float = 0.0
+    occlusion_alpha_max: float = 0.0
+
+
+def _augment_cfg_from_preset(preset: str) -> PostTrainAugmentConfig:
+    preset_l = str(preset).strip().lower()
+    if preset_l in {"", "none"}:
+        return PostTrainAugmentConfig()
+    if preset_l in {"geo", "geom", "geometry"}:
+        return PostTrainAugmentConfig(
+            hflip_prob=0.5,
+            hshift_max=1,
+            vshift_max=2,
+        )
+    if preset_l == "light":
+        return PostTrainAugmentConfig(
+            hflip_prob=0.5,
+            hshift_max=2,
+            vshift_max=3,
+            gamma_prob=0.10,
+            gamma_min=0.96,
+            gamma_max=1.06,
+            contrast_prob=0.10,
+            contrast_min=0.96,
+            contrast_max=1.06,
+            blur_prob=0.06,
+            blur_sigma_min=0.20,
+            blur_sigma_max=0.45,
+            noise_prob=0.06,
+            noise_std_max=0.008,
+        )
+    if preset_l in {"light_occ", "light_occlusion"}:
+        return PostTrainAugmentConfig(
+            hflip_prob=0.5,
+            hshift_max=2,
+            vshift_max=3,
+            gamma_prob=0.10,
+            gamma_min=0.96,
+            gamma_max=1.06,
+            contrast_prob=0.10,
+            contrast_min=0.96,
+            contrast_max=1.06,
+            blur_prob=0.06,
+            blur_sigma_min=0.20,
+            blur_sigma_max=0.45,
+            noise_prob=0.06,
+            noise_std_max=0.008,
+            occlusion_prob=0.10,
+            occlusion_count_min=1,
+            occlusion_count_max=1,
+            occlusion_width_min=4,
+            occlusion_width_max=8,
+            occlusion_noise_std=0.008,
+            occlusion_alpha_min=0.12,
+            occlusion_alpha_max=0.22,
+        )
+    if preset_l == "robust":
+        return PostTrainAugmentConfig(
+            hflip_prob=0.5,
+            hshift_max=3,
+            vshift_max=4,
+            gamma_prob=0.14,
+            gamma_min=0.94,
+            gamma_max=1.08,
+            contrast_prob=0.14,
+            contrast_min=0.94,
+            contrast_max=1.08,
+            blur_prob=0.08,
+            blur_sigma_min=0.20,
+            blur_sigma_max=0.60,
+            noise_prob=0.08,
+            noise_std_max=0.010,
+        )
+    if preset_l in {"robust_occ", "robust_occlusion"}:
+        return PostTrainAugmentConfig(
+            hflip_prob=0.5,
+            hshift_max=3,
+            vshift_max=4,
+            gamma_prob=0.14,
+            gamma_min=0.94,
+            gamma_max=1.08,
+            contrast_prob=0.14,
+            contrast_min=0.94,
+            contrast_max=1.08,
+            blur_prob=0.08,
+            blur_sigma_min=0.20,
+            blur_sigma_max=0.60,
+            noise_prob=0.08,
+            noise_std_max=0.010,
+            occlusion_prob=0.14,
+            occlusion_count_min=1,
+            occlusion_count_max=1,
+            occlusion_width_min=5,
+            occlusion_width_max=10,
+            occlusion_noise_std=0.010,
+            occlusion_alpha_min=0.15,
+            occlusion_alpha_max=0.28,
+        )
+    raise ValueError(
+        f"Unknown post-train augmentation preset {preset!r}. Expected one of: "
+        "'none', 'geo', 'light', 'light_occ', 'robust', 'robust_occ'."
+    )
+
+
+def _rand_bool(prob: float) -> bool:
+    if prob <= 0.0:
+        return False
+    return bool(torch.rand(()) < float(prob))
+
+
+def _rand_uniform(lo: float, hi: float) -> float:
+    if hi <= lo:
+        return float(lo)
+    return float(torch.empty((), dtype=torch.float32).uniform_(float(lo), float(hi)).item())
+
+
+def _rand_int(lo: int, hi: int) -> int:
+    if hi <= lo:
+        return int(lo)
+    return int(torch.randint(int(lo), int(hi) + 1, ()).item())
+
+
+def _shift_image_hw(image: torch.Tensor, *, dx: int, dy: int, fill: float) -> torch.Tensor:
+    c, h, w = image.shape
+    out = image.new_full((c, h, w), float(fill))
+
+    src_y0 = max(0, -int(dy))
+    src_y1 = min(h, h - int(dy))
+    src_x0 = max(0, -int(dx))
+    src_x1 = min(w, w - int(dx))
+    if src_y1 <= src_y0 or src_x1 <= src_x0:
+        return out
+
+    dst_y0 = max(0, int(dy))
+    dst_x0 = max(0, int(dx))
+    dst_y1 = dst_y0 + (src_y1 - src_y0)
+    dst_x1 = dst_x0 + (src_x1 - src_x0)
+    out[:, dst_y0:dst_y1, dst_x0:dst_x1] = image[:, src_y0:src_y1, src_x0:src_x1]
+    return out
+
+
+def _shift_target_x(y: np.ndarray, dx: int) -> np.ndarray:
+    dx_i = int(dx)
+    if dx_i == 0:
+        return y.copy()
+    out = np.empty_like(y)
+    if dx_i > 0:
+        out[:dx_i] = y[0]
+        out[dx_i:] = y[:-dx_i]
+    else:
+        k = -dx_i
+        out[-k:] = y[-1]
+        out[:-k] = y[k:]
+    return out
+
+
+def _apply_gamma(image: torch.Tensor, gamma: float) -> torch.Tensor:
+    gamma_f = max(float(gamma), 1e-4)
+    return image.clamp(0.0, 1.0).pow(gamma_f)
+
+
+def _apply_contrast(image: torch.Tensor, factor: float) -> torch.Tensor:
+    mean = image.mean(dim=(1, 2), keepdim=True)
+    return ((image - mean) * float(factor) + mean).clamp(0.0, 1.0)
+
+
+def _apply_blur(image: torch.Tensor, sigma: float) -> torch.Tensor:
+    sigma_f = max(float(sigma), 1e-4)
+    kernel = max(3, int(round(sigma_f * 6.0)))
+    if kernel % 2 == 0:
+        kernel += 1
+    return tvf.gaussian_blur(image, kernel_size=[kernel, kernel], sigma=[sigma_f, sigma_f])
+
+
+def _apply_noise(image: torch.Tensor, std: float) -> torch.Tensor:
+    std_f = max(float(std), 0.0)
+    if std_f <= 0.0:
+        return image
+    noise = torch.randn((1, image.shape[1], image.shape[2]), device=image.device, dtype=image.dtype) * std_f
+    return (image + noise.expand_as(image)).clamp(0.0, 1.0)
+
+
+def _apply_vertical_occlusion(image: torch.Tensor, cfg: PostTrainAugmentConfig) -> torch.Tensor:
+    width_lo = max(1, int(cfg.occlusion_width_min))
+    width_hi = max(width_lo, int(cfg.occlusion_width_max))
+    count = _rand_int(int(cfg.occlusion_count_min), int(cfg.occlusion_count_max))
+    c, h, w = image.shape
+    out = image
+    for _ in range(max(1, count)):
+        band_w = min(w, _rand_int(width_lo, width_hi))
+        if band_w <= 0 or band_w >= w:
+            x0 = 0
+            x1 = w
+        else:
+            x0 = _rand_int(0, w - band_w)
+            x1 = x0 + band_w
+        fill = torch.full((1, h, x1 - x0), float(out.mean().item()), dtype=out.dtype, device=out.device)
+        if cfg.occlusion_noise_std > 0:
+            fill = fill + torch.randn_like(fill) * float(cfg.occlusion_noise_std)
+        alpha = _rand_uniform(float(cfg.occlusion_alpha_min), float(cfg.occlusion_alpha_max))
+        alpha_t = torch.tensor(alpha, dtype=out.dtype, device=out.device)
+        src = out[:, :, x0:x1]
+        mixed = src * (1.0 - alpha_t) + fill.expand(c, -1, -1) * alpha_t
+        out[:, :, x0:x1] = mixed.clamp(0.0, 1.0)
+    return out
+
+
+class PostTrainTensorDataset(Dataset[tuple[torch.Tensor, np.ndarray | None]]):
+    def __init__(self, dataset: Dataset[tuple[torch.Tensor, np.ndarray | None]], *, augment_cfg: PostTrainAugmentConfig):
+        self.dataset = dataset
+        self.augment_cfg = augment_cfg
+        self.normalize = PerImageZScore(eps=1e-6)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _augment(self, image: torch.Tensor, target: np.ndarray | None) -> tuple[torch.Tensor, np.ndarray | None]:
+        cfg = self.augment_cfg
+        out = image.clamp(0.0, 1.0)
+        y = None if target is None else np.asarray(target, dtype=np.float32).copy()
+
+        if _rand_bool(cfg.hflip_prob):
+            out = torch.flip(out, dims=(2,))
+            if y is not None:
+                y = y[::-1].copy()
+
+        dx = _rand_int(-int(cfg.hshift_max), int(cfg.hshift_max)) if int(cfg.hshift_max) > 0 else 0
+        dy = _rand_int(-int(cfg.vshift_max), int(cfg.vshift_max)) if int(cfg.vshift_max) > 0 else 0
+        if dx != 0 or dy != 0:
+            out = _shift_image_hw(out, dx=dx, dy=dy, fill=float(out.mean().item()))
+            if y is not None:
+                if dx != 0:
+                    y = _shift_target_x(y, dx)
+                if dy != 0:
+                    y = np.clip(y + float(dy), 0.0, float(ORIG_H - 1)).astype(np.float32, copy=False)
+
+        if _rand_bool(cfg.gamma_prob):
+            out = _apply_gamma(out, _rand_uniform(cfg.gamma_min, cfg.gamma_max))
+        if _rand_bool(cfg.contrast_prob):
+            out = _apply_contrast(out, _rand_uniform(cfg.contrast_min, cfg.contrast_max))
+        if _rand_bool(cfg.blur_prob):
+            out = _apply_blur(out, _rand_uniform(cfg.blur_sigma_min, cfg.blur_sigma_max))
+        if _rand_bool(cfg.noise_prob):
+            out = _apply_noise(out, _rand_uniform(0.0, cfg.noise_std_max))
+        if _rand_bool(cfg.occlusion_prob):
+            out = _apply_vertical_occlusion(out, cfg)
+
+        return out.clamp(0.0, 1.0), y
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, np.ndarray | None]:
+        image, target = self.dataset[index]
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(f"Expected tensor image from base dataset; got {type(image)}")
+        image, target = self._augment(image, target)
+        return self.normalize(image), target
 
 
 class LoRALinear(nn.Module):
@@ -402,15 +680,15 @@ def build_optimizer(
     )
 
 
-def _make_oct_transform() -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.Resize((ORIG_H, ORIG_W), interpolation=InterpolationMode.BICUBIC),
-            MaybeToTensor(),
-            Ensure3CH(),
-            PerImageZScore(eps=1e-6),
-        ]
-    )
+def _make_oct_transform(*, normalize: bool = True) -> transforms.Compose:
+    transforms_list: list[object] = [
+        transforms.Resize((ORIG_H, ORIG_W), interpolation=InterpolationMode.BICUBIC),
+        MaybeToTensor(),
+        Ensure3CH(),
+    ]
+    if normalize:
+        transforms_list.append(PerImageZScore(eps=1e-6))
+    return transforms.Compose(transforms_list)
 
 
 def _collate_oct(batch: Iterable[tuple[torch.Tensor, np.ndarray | None]]) -> dict[str, torch.Tensor]:
@@ -441,6 +719,21 @@ def _grad_norm_l2(parameters: list[nn.Parameter]) -> torch.Tensor:
     if not norms:
         return torch.tensor(0.0, device=parameters[0].device if parameters else "cpu")
     return torch.linalg.vector_norm(torch.stack(norms))
+
+
+def _estimate_spike_kappa_for_indices(dataset: OCT, indices: list[int], *, quantile: float) -> float | None:
+    curves: list[np.ndarray] = []
+    entries = dataset._get_entries()
+    for idx in indices:
+        if int(entries[idx]["code"]) != 1:
+            continue
+        target = dataset.get_target(int(idx))
+        if target is None:
+            continue
+        curves.append(np.asarray(target, dtype=np.float32))
+    if not curves:
+        return None
+    return estimate_spike_kappa_from_curves(curves, quantile=quantile)
 
 
 def train_step(
@@ -562,6 +855,7 @@ def validate(
     criterion: CurveLoss,
     *,
     acc_tolerances: tuple[float, ...] = DEFAULT_ACC_TOLERANCES,
+    spike_kappa: float | None = None,
 ) -> dict[str, float]:
     model.eval()
     loss_col_ce_num_sum = 0.0
@@ -579,13 +873,15 @@ def validate(
     }
     for tau in acc_tolerances:
         metric_sums[metric_name_for_tolerance(tau)] = 0.0
+    if spike_kappa is not None:
+        metric_sums["spike_rate"] = 0.0
     for batch in data_loader:
         images = batch["image"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
         is_bg = batch["is_bg"].to(device, non_blocking=True).long()
         presence_logits, curve_logits = model(images)
 
-        _, metrics = criterion(curve_logits, y, is_bg)
+        loss, metrics = criterion(curve_logits, y, is_bg)
         bsz = float(images.shape[0])
         non_bg_cnt = float((is_bg == 0).sum().item())
         bg_cnt = bsz - non_bg_cnt
@@ -604,6 +900,7 @@ def validate(
                 y_hat[curve_mask],
                 y[curve_mask],
                 acc_tolerances=acc_tolerances,
+                spike_kappa=spike_kappa,
             )
             curve_cnt += float(curve_mask.sum().item())
             for metric_name, metric_values in batch_curve_metrics.items():
@@ -620,6 +917,8 @@ def validate(
     }
     for metric_name, metric_sum in metric_sums.items():
         out[f"val_{metric_name}"] = metric_sum / max(curve_cnt, 1.0) if curve_cnt > 0 else float("nan")
+    if spike_kappa is not None:
+        out["val_spike_kappa"] = float(spike_kappa)
     return out
 
 
@@ -639,23 +938,29 @@ def run_post_training(
     lr_warmup: int = 50,
     min_lr_mult: float = 0.1,
     ema_decay: float = 0.0,
-    sigma: float = 1.5,
-    lambda_curve: float = 1.0,
-    lambda_curv: float = 0.05,
+    sigma: float,
+    lambda_curve: float,
+    lambda_curv: float,
     eps_none: float = 0.02,
     curv_delta: float = 1.0,
-    lora_blocks: int = 3,
-    lora_r: int = 8,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    lora_use_mlp: bool = False,
+    lora_blocks: int,
+    lora_r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+    lora_use_mlp: bool,
     method: str = "sam",
     sam_rho: float = 0.05,
-    log_every: int = 10,
+    log_every: int,
     val_every: int = 1,
+    snapshot_every_steps: int = 0,
+    best_metric: str = "val_mae_px",
+    spike_kappa: float | None = None,
+    spike_kappa_quantile: float = 0.99,
+    aug_preset: str = "none",
     device: torch.device,
     output_path: Path,
     best_path: Path,
+    snapshot_dir: Path | None = None,
 ) -> tuple[Path, dict[str, float], dict[str, float] | None]:
     effective_seed = int(seed)
     fix_random_seeds(effective_seed)
@@ -675,32 +980,80 @@ def run_post_training(
         except Exception:
             pass
 
-    ds_full = make_dataset(dataset_str=dataset_str, transform=_make_oct_transform())
+    aug_cfg = _augment_cfg_from_preset(aug_preset)
+    use_augment_wrapper = any(
+        (
+            aug_cfg.hflip_prob > 0.0,
+            int(aug_cfg.hshift_max) > 0,
+            int(aug_cfg.vshift_max) > 0,
+            aug_cfg.gamma_prob > 0.0,
+            aug_cfg.contrast_prob > 0.0,
+            aug_cfg.blur_prob > 0.0,
+            aug_cfg.noise_prob > 0.0,
+            aug_cfg.occlusion_prob > 0.0,
+        )
+    )
+    ds_full = make_dataset(
+        dataset_str=dataset_str,
+        transform=_make_oct_transform(normalize=not use_augment_wrapper),
+    )
     if not isinstance(ds_full, OCT):
         raise TypeError(f"Expected OCT dataset for post-training; got {type(ds_full)}")
     entries = ds_full._get_entries()
-    if "split" not in entries.dtype.names:
-        raise ValueError("Post-train requires explicit train/val assignments in extra/splits.csv.")
 
-    split_values = np.char.lower(entries["split"].astype(str))
-    train_idx_all = np.nonzero(split_values == "train")[0].tolist()
-    val_idx_all = np.nonzero(split_values == "val")[0].tolist()
-    if not train_idx_all or not val_idx_all:
-        raise ValueError("Post-train requires explicit non-empty train and val assignments in extra/splits.csv.")
+    train_idx: list[int]
+    val_idx: list[int]
+    if "split" in entries.dtype.names:
+        split_values = np.char.lower(entries["split"].astype(str))
+        train_idx_np = np.nonzero(split_values == "train")[0]
+        val_idx_np = np.nonzero(split_values == "val")[0]
+        if train_idx_np.size > 0 and val_idx_np.size > 0:
+            train_idx = train_idx_np.tolist()
+            val_idx = val_idx_np.tolist()
+        else:
+            train_idx = []
+            val_idx = []
+    else:
+        train_idx = []
+        val_idx = []
 
-    train_codes_all = entries[train_idx_all]["code"]
-    val_codes_all = entries[val_idx_all]["code"]
-    train_idx = [idx for idx in train_idx_all if int(entries[idx]["code"]) in (1, 2)]
-    val_idx = [idx for idx in val_idx_all if int(entries[idx]["code"]) in (1, 2)]
-    train_codes = entries[train_idx]["code"]
-    val_codes = entries[val_idx]["code"]
-    if np.count_nonzero(train_codes == 1) == 0:
-        raise ValueError("Split-defined post-train set has no labeled curve samples in train.")
-    if np.count_nonzero(val_codes == 1) == 0:
-        raise ValueError("Split-defined post-train set has no labeled curve samples in val.")
-    if np.count_nonzero(train_codes == 2) == 0:
-        raise ValueError("Split-defined post-train set has no background samples in train.")
+    if not train_idx or not val_idx:
+        # Stratified split to ensure labeled samples appear in train/val.
+        curve_idx = np.nonzero(entries["code"] == 1)[0]
+        bg_idx = np.nonzero(entries["code"] == 2)[0]
+        if curve_idx.size == 0:
+            raise ValueError("Post-train requires labeled curve samples (entries with code==1); none found.")
 
+        rng = np.random.default_rng(int(seed))
+        rng.shuffle(curve_idx)
+        val_frac = 0.1
+        val_curve = int(round(curve_idx.size * val_frac))
+        val_curve = max(1, min(val_curve, int(curve_idx.size) - 1))
+
+        if bg_idx.size == 0:
+            logger.warning("Post-train dataset has no background samples; using labeled-only train/val split.")
+            train_idx = curve_idx[val_curve:].tolist()
+            val_idx = curve_idx[:val_curve].tolist()
+        else:
+            rng.shuffle(bg_idx)
+            val_bg = int(round(bg_idx.size * val_frac))
+            val_bg = max(1, min(val_bg, int(bg_idx.size) - 1))
+            train_idx = np.concatenate([curve_idx[val_curve:], bg_idx[val_bg:]]).tolist()
+            val_idx = np.concatenate([curve_idx[:val_curve], bg_idx[:val_bg]]).tolist()
+        rng.shuffle(train_idx)
+        rng.shuffle(val_idx)
+    else:
+        train_codes = entries["code"][train_idx]
+        val_codes = entries["code"][val_idx]
+        if np.count_nonzero(train_codes == 1) == 0:
+            raise ValueError("Split-defined post-train set has no labeled curve samples in train.")
+        if np.count_nonzero(val_codes == 1) == 0:
+            raise ValueError("Split-defined post-train set has no labeled curve samples in val.")
+        if np.count_nonzero(train_codes == 2) == 0:
+            logger.warning("Split-defined post-train set has no background samples in train; continuing in labeled-only mode.")
+
+    train_codes = entries["code"][train_idx]
+    val_codes = entries["code"][val_idx]
     logger.info(
         "effective post-train split: train=%d (labeled=%d, background=%d), val=%d (labeled=%d, background=%d)",
         len(train_idx),
@@ -710,35 +1063,67 @@ def run_post_training(
         int(np.count_nonzero(val_codes == 1)),
         int(np.count_nonzero(val_codes == 2)),
     )
-    logger.info(
-        "excluded unlabeled split entries from supervised post-train: train=%d, val=%d",
-        int(np.count_nonzero(train_codes_all == 0)),
-        int(np.count_nonzero(val_codes_all == 0)),
-    )
-    logger.info("effective post-train seed: %d", effective_seed)
 
-    ds = Subset(ds_full, train_idx)
-    ds_val = Subset(ds_full, val_idx)
+    logger.info("post-train augmentation preset: %s", str(aug_preset).strip().lower() or "none")
+    logger.info("effective post-train seed: %d", effective_seed)
+    ds: Dataset[tuple[torch.Tensor, np.ndarray | None]]
+    dl: DataLoader
+    if use_augment_wrapper:
+        ds = PostTrainTensorDataset(Subset(ds_full, train_idx), augment_cfg=aug_cfg)
+        ds_val = PostTrainTensorDataset(Subset(ds_full, val_idx), augment_cfg=PostTrainAugmentConfig())
+    else:
+        ds = Subset(ds_full, train_idx)
+        ds_val = Subset(ds_full, val_idx)
+
+    train_set_size = len(ds)
+    val_set_size = len(ds_val)
+    if train_set_size <= 0:
+        raise ValueError('skin_db post-train split produced an empty train set.')
+    if val_set_size <= 0:
+        raise ValueError('skin_db post-train split produced an empty val set.')
+
+    requested_batch_size = int(batch_size)
+    effective_train_batch_size = min(requested_batch_size, train_set_size)
+    effective_val_batch_size = min(requested_batch_size, val_set_size)
+    train_drop_last = train_set_size >= requested_batch_size
+    if effective_train_batch_size != requested_batch_size:
+        logger.warning(
+            'skin_db train set (%d samples) is smaller than requested batch size %d; using batch size %d with drop_last=False.',
+            train_set_size,
+            requested_batch_size,
+            effective_train_batch_size,
+        )
+
     train_generator = torch.Generator()
     train_generator.manual_seed(effective_seed)
     dl = DataLoader(
         ds,
-        batch_size=batch_size,
+        batch_size=effective_train_batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=train_drop_last,
         collate_fn=_collate_oct,
         generator=train_generator,
     )
     dl_val = DataLoader(
         ds_val,
-        batch_size=batch_size,
+        batch_size=effective_val_batch_size,
         shuffle=False,
         num_workers=max(1, num_workers // 2),
         pin_memory=True,
         drop_last=False,
         collate_fn=_collate_oct,
+    )
+    if len(dl) == 0:
+        raise ValueError(
+            f'skin_db post-train DataLoader is empty: train_set_size={train_set_size}, '
+            f'batch_size={effective_train_batch_size}, drop_last={train_drop_last}'
+        )
+    spike_kappa_value = (
+        float(spike_kappa)
+        if spike_kappa is not None
+        else _estimate_spike_kappa_for_indices(ds_full, val_idx, quantile=float(spike_kappa_quantile))
     )
 
     model = CurveModel(
@@ -753,8 +1138,9 @@ def run_post_training(
         },
     ).to(device)
     ema: ModelEMA | None = None
-    if 0.0 < float(ema_decay) < 1.0:
-        ema = ModelEMA(model, decay=float(ema_decay))
+    ema_decay_f = float(ema_decay)
+    if 0.0 < ema_decay_f < 1.0:
+        ema = ModelEMA(model, decay=ema_decay_f)
     criterion = CurveLoss(
         LossCfg(
             sigma=sigma,
@@ -791,8 +1177,15 @@ def run_post_training(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     best_path.parent.mkdir(parents=True, exist_ok=True)
-    val_every_epochs = max(1, int(val_every))
-    best_val_mae = float("inf")
+    snapshot_every = max(0, int(snapshot_every_steps))
+    if snapshot_every > 0:
+        snapshot_dir = snapshot_dir or (best_path.parent / "snapshots")
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    val_every_steps = max(1, int(val_every))
+    best_metric_name = str(best_metric).strip() or "val_mae_px"
+    maximize_best_metric = best_metric_name.startswith("val_acc_")
+    best_metric_value = -float("inf") if maximize_best_metric else float("inf")
     best_step = 0
     vm_best: dict[str, float] | None = None
     vm_final: dict[str, float] | None = None
@@ -812,6 +1205,13 @@ def run_post_training(
             "step": int(seen),
         }
 
+    def is_better_metric(metric_value: float) -> bool:
+        if not math.isfinite(metric_value):
+            return False
+        if maximize_best_metric:
+            return metric_value > best_metric_value
+        return metric_value < best_metric_value
+
     seen = 0
     epoch = 0
     while seen < steps:
@@ -823,9 +1223,12 @@ def run_post_training(
             elif method_l == "sam":
                 sam = float(sam_rho)
             else:
-                raise ValueError(f"Unknown post-train method {method!r}; expected 'sam' or 'adamw'.")
+                raise ValueError(f"Unknown post_train.method={method!r} (expected 'adamw' or 'sam').")
+
             lr_head_cur = float(opt.param_groups[0].get("lr", 0.0)) if opt.param_groups else 0.0
-            lr_lora_cur = float(opt.param_groups[1].get("lr", lr_head_cur)) if len(opt.param_groups) > 1 else lr_head_cur
+            lr_lora_cur = (
+                float(opt.param_groups[1].get("lr", lr_head_cur)) if len(opt.param_groups) > 1 else lr_head_cur
+            )
             stats = train_step(batch, model, criterion, opt, scaler=scaler, sam_rho=sam)
             seen += 1
             if ema is not None and seen >= warmup_steps:
@@ -861,24 +1264,41 @@ def run_post_training(
                     ]
                 )
                 metrics_fh.flush()
+            if snapshot_every > 0 and snapshot_dir is not None and (seen % snapshot_every == 0 or seen >= steps):
+                snapshot_path = snapshot_dir / f"fused_curve_step_{seen:05d}.pth"
+                torch.save(current_checkpoint_payload(), snapshot_path)
             if seen >= steps:
                 break
-
-        if epoch % val_every_epochs == 0 or seen >= steps:
-            vm_cur = validate(current_eval_model(), dl_val, device, criterion, acc_tolerances=DEFAULT_ACC_TOLERANCES)
-            cur_val_mae = float(vm_cur.get("val_mae_px", float("inf")))
+        if seen % val_every_steps == 0 or seen >= steps:
+            vm_cur = validate(
+                current_eval_model(),
+                dl_val,
+                device,
+                criterion,
+                acc_tolerances=DEFAULT_ACC_TOLERANCES,
+                spike_kappa=spike_kappa_value,
+            )
+            cur_metric_value = float(
+                vm_cur.get(best_metric_name, -float("inf") if maximize_best_metric else float("inf"))
+            )
             logger.info(
-                "[post val epoch %d step %d/%d] val_loss=%.6f val_mae_px=%.3f val_p95_px=%.3f val_acc_2px=%.3f",
-                epoch,
+                "[post val step %d/%d] selected_metric[%s]=%.6f "
+                "val_loss=%.6f val_mae_px=%.3f val_p95_px=%.3f val_acc_2px=%.3f",
                 seen,
                 steps,
+                best_metric_name,
+                cur_metric_value,
                 float(vm_cur.get("val_loss", float("nan"))),
-                cur_val_mae,
+                float(vm_cur.get("val_mae_px", float("nan"))),
                 float(vm_cur.get("val_p95_px", float("nan"))),
                 float(vm_cur.get("val_acc_2px", float("nan"))),
             )
-            if math.isfinite(cur_val_mae) and cur_val_mae < best_val_mae:
-                best_val_mae = cur_val_mae
+            if best_metric_name not in vm_cur:
+                raise KeyError(
+                    f"Requested best_metric={best_metric_name!r}, but validate() produced keys: {sorted(vm_cur.keys())}"
+                )
+            if is_better_metric(cur_metric_value):
+                best_metric_value = cur_metric_value
                 best_step = seen
                 vm_best = dict(vm_cur)
                 torch.save(current_checkpoint_payload(), best_path)
@@ -897,25 +1317,37 @@ def run_post_training(
             output_path,
         )
     if vm_final is None:
-        vm_final = validate(current_eval_model(), dl_val, device, criterion, acc_tolerances=DEFAULT_ACC_TOLERANCES)
+        vm_final = validate(
+            current_eval_model(),
+            dl_val,
+            device,
+            criterion,
+            acc_tolerances=DEFAULT_ACC_TOLERANCES,
+            spike_kappa=spike_kappa_value,
+        )
     if vm_best is None:
         vm_best = dict(vm_final)
-        best_val_mae = float(vm_final.get("val_mae_px", float("inf")))
+        best_metric_value = float(
+            vm_final.get(best_metric_name, -float("inf") if maximize_best_metric else float("inf"))
+        )
         best_step = seen
         torch.save(current_checkpoint_payload(), best_path)
     metrics_fh.close()
 
+    best_vm = vm_best
     best_source = "final" if best_step == seen else "best_ckpt"
     final_val_loss = float(vm_final.get("val_loss", float("nan")))
     best_ckpt_val_loss = float(vm_best.get("val_loss", float("nan")))
-    best_val_loss = float(vm_best.get("val_loss", float("nan")))
-    best_val_p95 = float(vm_best.get("val_p95_px", float("nan")))
-    best_val_acc2 = float(vm_best.get("val_acc_2px", float("nan")))
+    best_val_loss = float(best_vm.get("val_loss", float("nan")))
+    best_metric_result = float(best_vm.get(best_metric_name, float("nan")))
+    best_val_mae = float(best_vm.get("val_mae_px", float("nan")))
+    best_val_p95 = float(best_vm.get("val_p95_px", float("nan")))
+    best_val_acc2 = float(best_vm.get("val_acc_2px", float("nan")))
     print(
         f"[post] done. val_loss_final={final_val_loss:.6f} "
         f"val_loss_best_ckpt={best_ckpt_val_loss:.6f} "
-        f"best_val_mae_px={best_val_mae:.6f} ({best_source}@{best_step}) "
-        f"val_p95_px={best_val_p95:.3f} val_acc_2px={best_val_acc2:.3f}"
+        f"best_metric[{best_metric_name}]={best_metric_result:.6f} ({best_source}@{best_step}) "
+        f"val_mae_px={best_val_mae:.3f} val_p95_px={best_val_p95:.3f} val_acc_2px={best_val_acc2:.3f}"
     )
 
     try:
@@ -928,9 +1360,12 @@ def run_post_training(
                     "best_val_loss": best_val_loss,
                     "best_source": best_source,
                     "best_step": best_step,
-                    "best_val_mae_px": best_val_mae,
-                    "val_every": val_every_epochs,
-                    "val_every_unit": "epochs",
+                    "best_metric": best_metric_name,
+                    "best_metric_value": best_metric_result,
+                    "val_every": val_every_steps,
+                    "val_every_unit": "steps",
+                    "snapshot_every_steps": snapshot_every,
+                    "spike_kappa": spike_kappa_value,
                 },
                 indent=2,
             )
