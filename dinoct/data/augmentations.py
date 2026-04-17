@@ -78,7 +78,8 @@ class DataAugmentationDINO(object):
             ]
         )
 
-        resize_global = nn.Identity()  # Resize transform applied to global crops after random crop
+        resize_global = nn.Identity()  # Resize transform applied to global crops before other transforms
+        self.resize_global_pre_transf = resize_global
         self.resize_global_post_transf = (
             nn.Identity()
         )  # Resize transform applied to global crops after all other transforms
@@ -105,6 +106,8 @@ class DataAugmentationDINO(object):
                 gram_teacher_crops_size,
                 interpolation=tv.InterpolationMode.BICUBIC,
             )
+
+        self.resize_global_pre_transf = resize_global
 
         self.geometric_augmentation_local = tv.Compose(
             [
@@ -167,19 +170,19 @@ class DataAugmentationDINO(object):
         # global crops:
         im1_base = self.geometric_augmentation_global(image)
         global_crop_1_transf = self.global_transfo1(im1_base)
-        global_crop_1 = self.global_transfo1(global_crop_1_transf)
+        global_crop_1 = self.resize_global_post_transf(global_crop_1_transf)
 
         im2_base = self.geometric_augmentation_global(image)
         global_crop_2_transf = self.global_transfo2(im2_base)
-        global_crop_2 = self.global_transfo2(global_crop_2_transf)
+        global_crop_2 = self.resize_global_post_transf(global_crop_2_transf)
 
         output["global_crops"] = [global_crop_1, global_crop_2]
 
         # global crops for teacher:
         if self.teacher_no_color_jitter:
             output["global_crops_teacher"] = [
-                self.normalize(im1_base),
-                self.normalize(im2_base),
+                self.resize_global_post_transf(self.normalize(self.resize_global_pre_transf(im1_base))),
+                self.resize_global_post_transf(self.normalize(self.resize_global_pre_transf(im2_base))),
             ]
         else:
             output["global_crops_teacher"] = [global_crop_1, global_crop_2]

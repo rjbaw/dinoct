@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn.init
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..layers.drop_path import DropPath
 
@@ -126,6 +127,7 @@ class ConvNeXt(nn.Module):
         self.embed_dim = int(dims[-1])
         self.norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
         self.head = nn.Identity()
+        self.gradient_checkpointing = False
 
         # Best-effort `n_blocks` for layer-wise decay code paths.
         self.n_blocks = int(sum(int(d) for d in depths))
@@ -185,7 +187,10 @@ class ConvNeXt(nn.Module):
 
             for i in range(4):
                 x = self.downsample_layers[i](x)
-                x = self.stages[i](x)
+                if self.training and bool(self.gradient_checkpointing) and x.requires_grad:
+                    x = checkpoint(self.stages[i], x, use_reentrant=False)
+                else:
+                    x = self.stages[i](x)
 
             x_pool = x.mean(dim=(-2, -1))  # (B, C)
             x_tokens = self._maybe_resize_tokens(x, input_hw=input_hw)
