@@ -60,18 +60,36 @@ class DINOLoss(nn.Module):
         Q *= B  # the columns must sum to 1 so that Q is an assignment
         return Q.t()
 
-    def forward(self, student_output_list, teacher_out_softmaxed_centered_list):
+    def forward(
+        self,
+        student_output_list,
+        teacher_out_softmaxed_centered_list,
+        *,
+        ignore_diagonal: bool = False,
+    ):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
-        # TODO: Use cross_entropy_distribution here
-        total_loss = 0
-        for s in student_output_list:
-            lsm = F.log_softmax(s / self.student_temp, dim=-1)
-            for t in teacher_out_softmaxed_centered_list:
-                loss = torch.sum(t * lsm, dim=-1)
-                total_loss -= loss.mean()
-        return total_loss
+        student_logits = torch.stack(student_output_list, dim=0).float()
+        teacher_probs = torch.stack(teacher_out_softmaxed_centered_list, dim=0).float()
+
+        student_logp = F.log_softmax(student_logits / self.student_temp, dim=-1)
+        student_crops, batch_size, _ = student_logp.shape
+        teacher_crops = teacher_probs.shape[0]
+
+        if not ignore_diagonal:
+            return -torch.einsum("sbk,tbk->", student_logp, teacher_probs) / (
+                batch_size * student_crops * teacher_crops
+            )
+
+        pair_loss = -torch.einsum("sbk,tbk->st", student_logp, teacher_probs)
+        min_crops = min(student_crops, teacher_crops)
+        valid_pairs = student_crops * teacher_crops - min_crops
+        if valid_pairs <= 0:
+            raise ValueError("ignore_diagonal=True requires at least one non-diagonal teacher/student pair.")
+        keep = torch.ones((student_crops, teacher_crops), dtype=torch.bool, device=pair_loss.device)
+        keep.diagonal()[:min_crops] = False
+        return pair_loss[keep].sum() / (batch_size * valid_pairs)
 
     @torch.no_grad()
     def update_center(self, teacher_output):

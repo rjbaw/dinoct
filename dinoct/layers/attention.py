@@ -2,8 +2,6 @@ import logging
 import torch
 from torch import nn, Tensor
 
-import numpy as np
-
 import torch.nn.functional as F
 
 from ..utils import cat_keep_shapes, uncat_with_shapes
@@ -26,10 +24,16 @@ class LinearKMaskedBias(nn.Linear):
         o = self.out_features
         assert o % 3 == 0
         if self.bias is not None:
-            self.register_buffer("bias_mask", torch.full_like(self.bias, fill_value=np.nan))
+            mask = torch.ones_like(self.bias)
+            mask[o // 3 : 2 * o // 3] = 0
+            self.register_buffer("bias_mask", mask, persistent=False)
 
     def forward(self, input: Tensor) -> Tensor:
-        masked_bias = self.bias * self.bias_mask.to(self.bias.dtype) if self.bias is not None else None
+        masked_bias = (
+            self.bias * self.bias_mask.to(device=self.bias.device, dtype=self.bias.dtype)
+            if self.bias is not None
+            else None
+        )
         return F.linear(input, self.weight, masked_bias)
 
 
@@ -91,7 +95,8 @@ class SelfAttention(nn.Module):
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        x = nn.functional.scaled_dot_product_attention(q, k, v)
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
 
@@ -112,6 +117,7 @@ class SelfAttention(nn.Module):
             att_out.append(self.compute_attention(qkv, attn_bias=attn_bias, rope=rope))
         x_flat, shapes, num_tokens = cat_keep_shapes(att_out)
         x_flat = self.proj(x_flat)
+        x_flat = self.proj_drop(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
 

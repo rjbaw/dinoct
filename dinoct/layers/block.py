@@ -61,7 +61,7 @@ class SelfAttentionBlock(nn.Module):
             bias=ffn_bias,
             device=device,
         )
-        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.ls2 = LayerScale(dim, init_values=init_values, device=device) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.sample_drop_ratio = drop_path
@@ -198,9 +198,13 @@ class SelfAttentionBlock(nn.Module):
 
         return x_ffn
 
-    def forward(self, x_or_x_list: Tensor | list, rope_or_rope_list: list | None = None) -> list[Tensor]:
+    def forward(
+        self,
+        x_or_x_list: Tensor | list[Tensor],
+        rope_or_rope_list: tuple[Tensor, Tensor] | list[tuple[Tensor, Tensor] | None] | None = None,
+    ) -> Tensor | list[Tensor]:
         if isinstance(x_or_x_list, Tensor):
-            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list])
+            return self._forward_list([x_or_x_list], rope_list=[rope_or_rope_list])[0]
         if isinstance(x_or_x_list, list):
             if rope_or_rope_list is None:
                 rope_or_rope_list = [None for _ in x_or_x_list]

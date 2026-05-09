@@ -24,7 +24,7 @@ REPO_ROOT = _find_repo_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dinoct.models import build_backbone  # noqa: E402
+from dinoct.models import build_backbone, native_patch_size_for_backbone  # noqa: E402
 from dinoct.train.post_train import CurveModel, LoRALinear, ORIG_H, ORIG_W  # noqa: E402
 
 log = logging.getLogger("export")
@@ -119,10 +119,11 @@ def build_model(backbone_name: str, model_path: str, device: torch.device) -> Cu
         log.info(f"Auto-detected backbone: {backbone_name}")
 
     arch = backbone_name.replace("vit_", "") if backbone_name.startswith("vit_") else backbone_name
-    backbone = build_backbone(arch, patch_size=14)
+    patch_size = native_patch_size_for_backbone(arch)
+    backbone = build_backbone(arch, patch_size=patch_size)
     model = CurveModel(
         backbone=backbone,
-        patch_size=14,
+        patch_size=patch_size,
         lora_cfg={"blocks": 3, "r": 8, "alpha": 16, "dropout": 0.05, "use_mlp": False},
     )
     model.eval()

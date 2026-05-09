@@ -140,6 +140,7 @@ def _pick_device(device_arg: str) -> torch.device:
 def _infer_backbone_spec_from_state_dict(state: dict[str, Any]) -> tuple[str | None, int | None]:
     keys = list(state.keys())
     if any(k.startswith("backbone.stages.") or k.startswith("backbone.downsample_layers.") for k in keys):
+        stem_weight = state.get("backbone.downsample_layers.0.0.weight")
         stage2_re = re.compile(r"^backbone\.stages\.2\.(\d+)\.")
         stage2_idx: list[int] = []
         for key in keys:

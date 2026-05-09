@@ -3,19 +3,21 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import amp, nn, optim
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import Subset
 
 from ..data import DataAugmentationDINO, MaskingGenerator, collate_data_and_cast, make_data_loader, make_dataset
 from ..data.datasets import OCT
 from ..layers import DINOHead
-from ..loss import DINOLoss, KoLeoLoss, iBOTPatchLoss
+from ..loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 from ..models import build_backbone
 from ..utils import fix_random_seeds
 from .core.schedules import cosine_schedule, linear_warmup_cosine_decay
@@ -109,11 +111,20 @@ def ssl_split_path(dataset_str: str) -> Path | None:
     return splits_path
 
 
+def _global_mask_grid_size(global_size: int, patch_size: int) -> int:
+    if patch_size <= 0:
+        raise ValueError("student.patch_size must be positive")
+    if global_size % patch_size != 0:
+        raise ValueError("crops.global_crops_size must be divisible by student.patch_size")
+    return global_size // patch_size
+
+
 def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, int]:
     global_size = int(get_cfg(cfg, ("crops", "global_crops_size"), 224))
     local_size = int(get_cfg(cfg, ("crops", "local_crops_size"), 96))
     local_num = int(get_cfg(cfg, ("crops", "local_crops_number"), 8))
     patch_size = int(get_cfg(cfg, ("student", "patch_size"), 14))
+    global_mask_grid = _global_mask_grid_size(global_size, patch_size)
     dataset_str = resolve_dataset_path(
         str(get_cfg(cfg, ("train", "dataset_path"), "OCT:root=data/oct:extra=data/oct/extra"))
     )
@@ -125,16 +136,19 @@ def build_dataloader(cfg: dict[str, Any]) -> tuple[torch.utils.data.DataLoader, 
         local_num,
         global_crops_size=global_size,
         local_crops_size=local_size,
+        gram_teacher_crops_size=get_cfg(cfg, ("crops", "gram_teacher_crops_size"), None),
+        gram_teacher_no_distortions=bool(get_cfg(cfg, ("crops", "gram_teacher_no_distortions"), False)),
+        teacher_no_color_jitter=bool(get_cfg(cfg, ("teacher", "teacher_no_color_jitter"), False)),
         patch_size=patch_size,
         share_color_jitter=bool(get_cfg(cfg, ("train", "share_color_jitter"), False)),
         horizontal_flips=bool(get_cfg(cfg, ("train", "horizontal_flips"), True)),
     )
 
     mask_gen = MaskingGenerator(
-        input_size=(global_size // patch_size, global_size // patch_size),
-        max_num_patches=int(0.5 * (global_size // patch_size) ** 2),
+        input_size=(global_mask_grid, global_mask_grid),
+        max_num_patches=int(0.5 * global_mask_grid**2),
     )
-    n_tokens = (global_size // patch_size) ** 2
+    n_tokens = global_mask_grid**2
     collate_fn = lambda batch: collate_data_and_cast(  # noqa: E731
         batch,
         mask_ratio_tuple=tuple(get_cfg(cfg, ("ibot", "mask_ratio_min_max"), (0.1, 0.5))),
@@ -182,6 +196,68 @@ def _resolve_ffn_layer(name: str) -> str:
     return name
 
 
+def _cfg_path_is_set(path: Any) -> bool:
+    return path is not None and str(path).strip().lower() not in {"", "none", "null"}
+
+
+def _build_backbone_from_cfg(cfg: dict[str, Any], device: torch.device) -> nn.Module:
+    arch_raw = str(get_cfg(cfg, ("student", "arch"), "vit_small"))
+    arch = arch_raw.replace("vit_", "") if arch_raw.startswith("vit_") else arch_raw
+    return build_backbone(
+        arch,
+        patch_size=int(get_cfg(cfg, ("student", "patch_size"), 14)),
+        drop_path_rate=float(get_cfg(cfg, ("student", "drop_path_rate"), 0.0)),
+        drop_path_uniform=bool(get_cfg(cfg, ("student", "drop_path_uniform"), False)),
+        block_chunks=int(get_cfg(cfg, ("student", "block_chunks"), 0)),
+        layerscale_init=get_cfg(cfg, ("student", "layerscale"), None),
+        ffn_layer=_resolve_ffn_layer(str(get_cfg(cfg, ("student", "ffn_layer"), "mlp"))),
+        qkv_bias=bool(get_cfg(cfg, ("student", "qkv_bias"), True)),
+        proj_bias=bool(get_cfg(cfg, ("student", "proj_bias"), True)),
+        ffn_bias=bool(get_cfg(cfg, ("student", "ffn_bias"), True)),
+        n_storage_tokens=int(get_cfg(cfg, ("student", "n_storage_tokens"), 0)),
+        mask_k_bias=bool(get_cfg(cfg, ("student", "mask_k_bias"), False)),
+        device=device,
+    ).to(device)
+
+
+def _extract_backbone_state(checkpoint: Any) -> dict[str, torch.Tensor]:
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Gram checkpoint must be a state dict or a checkpoint dict")
+    if isinstance(checkpoint.get("teacher"), dict):
+        return checkpoint["teacher"]
+    if isinstance(checkpoint.get("student"), dict):
+        return checkpoint["student"]
+    if isinstance(checkpoint.get("model"), dict):
+        checkpoint = checkpoint["model"]
+
+    prefixes = ("teacher.backbone.", "module.teacher.backbone.", "student.backbone.", "module.student.backbone.")
+    for prefix in prefixes:
+        state = {k[len(prefix) :]: v for k, v in checkpoint.items() if isinstance(k, str) and k.startswith(prefix)}
+        if state:
+            return state
+    return checkpoint
+
+
+def load_gram_teacher_checkpoint(gram_teacher: nn.Module, ckpt_path: Path | str, device: torch.device) -> None:
+    checkpoint = torch.load(Path(ckpt_path), map_location=device)
+    state = _extract_backbone_state(checkpoint)
+    missing, unexpected = gram_teacher.load_state_dict(state, strict=False)
+    if missing:
+        logger.warning("Gram teacher checkpoint missing %d keys; first missing key: %s", len(missing), missing[0])
+    if unexpected:
+        logger.warning("Gram teacher checkpoint has %d unexpected keys; first unexpected key: %s", len(unexpected), unexpected[0])
+
+
+def copy_gram_teacher_from_teacher(bundle: "ModelBundle") -> None:
+    if bundle.gram_teacher is None:
+        return
+    bundle.gram_teacher.load_state_dict(bundle.teacher.state_dict(), strict=False)
+    for p in bundle.gram_teacher.parameters():
+        p.requires_grad = False
+    bundle.gram_teacher.eval()
+    bundle.gram_teacher_initialized = True
+
+
 @dataclass
 class ModelBundle:
     student: nn.Module
@@ -190,45 +266,58 @@ class ModelBundle:
     teacher_head: DINOHead
     student_ibot_head: DINOHead | None
     teacher_ibot_head: DINOHead | None
+    gram_teacher: nn.Module | None = None
+    gram_teacher_initialized: bool = False
+
+
+def set_teacher_eval(bundle: ModelBundle) -> None:
+    bundle.teacher.eval()
+    bundle.teacher_head.eval()
+    if bundle.teacher_ibot_head is not None:
+        bundle.teacher_ibot_head.eval()
+    if bundle.gram_teacher is not None:
+        bundle.gram_teacher.eval()
+
+
+def build_pretrain_checkpoint(
+    bundle: ModelBundle,
+    cfg: dict[str, Any],
+    *,
+    iteration: int,
+    optimizer: optim.Optimizer | None = None,
+    scaler: amp.GradScaler | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    checkpoint = {
+        "student": bundle.student.state_dict(),
+        "student_head": bundle.student_head.state_dict(),
+        "student_ibot_head": bundle.student_ibot_head.state_dict() if bundle.student_ibot_head else None,
+        "teacher": bundle.teacher.state_dict(),
+        "teacher_head": bundle.teacher_head.state_dict(),
+        "teacher_ibot_head": bundle.teacher_ibot_head.state_dict() if bundle.teacher_ibot_head else None,
+        "gram_teacher": bundle.gram_teacher.state_dict() if bundle.gram_teacher else None,
+        "iteration": int(iteration),
+        "config": cfg,
+    }
+    if optimizer is not None:
+        checkpoint["optimizer"] = optimizer.state_dict()
+    if scaler is not None:
+        checkpoint["scaler"] = scaler.state_dict()
+    if extra:
+        checkpoint.update(extra)
+    return checkpoint
+
+
+def save_pretrain_checkpoint(path: Path, checkpoint: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    torch.save(checkpoint, tmp_path)
+    tmp_path.replace(path)
 
 
 def build_models(cfg: dict[str, Any], device: torch.device) -> ModelBundle:
-    arch_raw = str(get_cfg(cfg, ("student", "arch"), "vit_small"))
-    if arch_raw.startswith("vit_"):
-        arch = arch_raw.replace("vit_", "")
-    else:
-        arch = arch_raw
-    patch_size = int(get_cfg(cfg, ("student", "patch_size"), 14))
-    drop_path_rate = float(get_cfg(cfg, ("student", "drop_path_rate"), 0.0))
-    layerscale = get_cfg(cfg, ("student", "layerscale"), None)
-    ffn_layer = _resolve_ffn_layer(str(get_cfg(cfg, ("student", "ffn_layer"), "mlp")))
-
-    student = build_backbone(
-        arch,
-        patch_size=patch_size,
-        drop_path_rate=drop_path_rate,
-        layerscale_init=layerscale,
-        ffn_layer=ffn_layer,
-        qkv_bias=bool(get_cfg(cfg, ("student", "qkv_bias"), True)),
-        proj_bias=bool(get_cfg(cfg, ("student", "proj_bias"), True)),
-        ffn_bias=bool(get_cfg(cfg, ("student", "ffn_bias"), True)),
-        n_storage_tokens=int(get_cfg(cfg, ("student", "num_register_tokens"), 0)),
-        mask_k_bias=bool(get_cfg(cfg, ("student", "mask_k_bias"), False)),
-        device=device,
-    ).to(device)
-    teacher = build_backbone(
-        arch,
-        patch_size=patch_size,
-        drop_path_rate=drop_path_rate,
-        layerscale_init=layerscale,
-        ffn_layer=ffn_layer,
-        qkv_bias=bool(get_cfg(cfg, ("student", "qkv_bias"), True)),
-        proj_bias=bool(get_cfg(cfg, ("student", "proj_bias"), True)),
-        ffn_bias=bool(get_cfg(cfg, ("student", "ffn_bias"), True)),
-        n_storage_tokens=int(get_cfg(cfg, ("student", "num_register_tokens"), 0)),
-        mask_k_bias=bool(get_cfg(cfg, ("student", "mask_k_bias"), False)),
-        device=device,
-    ).to(device)
+    student = _build_backbone_from_cfg(cfg, device)
+    teacher = _build_backbone_from_cfg(cfg, device)
     teacher.load_state_dict(student.state_dict(), strict=False)
     for p in teacher.parameters():
         p.requires_grad = False
@@ -261,6 +350,16 @@ def build_models(cfg: dict[str, Any], device: torch.device) -> ModelBundle:
     ibot_hidden = int(get_cfg(cfg, ("ibot", "head_hidden_dim"), dino_hidden))
     ibot_bottleneck = int(get_cfg(cfg, ("ibot", "head_bottleneck_dim"), dino_bottleneck))
     ibot_nlayers = int(get_cfg(cfg, ("ibot", "head_nlayers"), dino_nlayers))
+    if not ibot_separate:
+        if ibot_out != dino_out:
+            raise ValueError(
+                "ibot.head_n_prototypes must equal dino.head_n_prototypes when ibot.separate_head=false"
+            )
+        if (ibot_hidden, ibot_bottleneck, ibot_nlayers) != (dino_hidden, dino_bottleneck, dino_nlayers):
+            raise ValueError(
+                "iBOT head hidden_dim, bottleneck_dim, and nlayers must match DINO head settings "
+                "when ibot.separate_head=false"
+            )
     student_ibot_head = None
     teacher_ibot_head = None
     if ibot_separate:
@@ -282,14 +381,31 @@ def build_models(cfg: dict[str, Any], device: torch.device) -> ModelBundle:
         for p in teacher_ibot_head.parameters():
             p.requires_grad = False
 
-    return ModelBundle(
+    gram_teacher = None
+    gram_teacher_initialized = False
+    if bool(get_cfg(cfg, ("gram", "use_loss"), False)) and not bool(get_cfg(cfg, ("gram", "ema_teacher"), False)):
+        gram_teacher = _build_backbone_from_cfg(cfg, device)
+        for p in gram_teacher.parameters():
+            p.requires_grad = False
+        gram_ckpt = get_cfg(cfg, ("gram", "ckpt"), None)
+        if _cfg_path_is_set(gram_ckpt):
+            load_gram_teacher_checkpoint(gram_teacher, Path(str(gram_ckpt)), device)
+            gram_teacher_initialized = True
+        elif int(get_cfg(cfg, ("gram", "it_load_ema_teacher"), -1)) < 0:
+            raise ValueError("Set gram.ckpt, gram.ema_teacher=true, or gram.it_load_ema_teacher>=0 to use Gram loss.")
+
+    bundle = ModelBundle(
         student=student,
         teacher=teacher,
         student_head=student_head,
         teacher_head=teacher_head,
         student_ibot_head=student_ibot_head,
         teacher_ibot_head=teacher_ibot_head,
+        gram_teacher=gram_teacher,
+        gram_teacher_initialized=gram_teacher_initialized,
     )
+    set_teacher_eval(bundle)
+    return bundle
 
 
 @dataclass
@@ -298,6 +414,7 @@ class Schedules:
     weight_decay: list[float]
     teacher_temp: list[float]
     momentum: list[float]
+    gram_loss_weight: list[float]
     freeze_last_layer_iters: int
 
 
@@ -344,6 +461,26 @@ def build_optimizer_and_schedules(
         total_iterations=total_iters,
         cosine_iterations=max(total_iters - warm_temp_iters, 1),
     )
+    gram_loss_schedule = [0.0] * total_iters
+    if bool(get_cfg(cfg, ("gram", "use_loss"), False)):
+        gram_schedule_cfg = get_cfg(cfg, ("gram", "loss_weight_schedule"), None)
+        if isinstance(gram_schedule_cfg, dict):
+            gram_warmup_iters = int(float(gram_schedule_cfg.get("warmup_epochs", 0)) * epoch_length)
+            gram_cosine_iters = (
+                int(float(gram_schedule_cfg["cosine_epochs"]) * epoch_length)
+                if "cosine_epochs" in gram_schedule_cfg
+                else None
+            )
+            gram_loss_schedule = linear_warmup_cosine_decay(
+                start=float(gram_schedule_cfg.get("start", 0.0)),
+                peak=float(gram_schedule_cfg.get("peak", get_cfg(cfg, ("gram", "loss_weight"), 1.0))),
+                end=float(gram_schedule_cfg.get("end", get_cfg(cfg, ("gram", "loss_weight"), 1.0))),
+                warmup_iterations=gram_warmup_iters,
+                total_iterations=total_iters,
+                cosine_iterations=gram_cosine_iters,
+            )
+        else:
+            gram_loss_schedule = [float(get_cfg(cfg, ("gram", "loss_weight"), 1.0))] * total_iters
 
     backbone_param_groups = get_params_groups_with_decay_fsdp(
         bundle.student,
@@ -380,6 +517,7 @@ def build_optimizer_and_schedules(
         weight_decay=wd_schedule,
         teacher_temp=teacher_temp_schedule,
         momentum=momentum_schedule,
+        gram_loss_weight=gram_loss_schedule,
         freeze_last_layer_iters=freeze_epochs * epoch_length,
     )
     return optimizer, schedules
@@ -389,6 +527,80 @@ def update_teacher_weights(student: nn.Module, teacher: nn.Module, momentum: flo
     with torch.no_grad():
         for ps, pt in zip(student.parameters(), teacher.parameters()):
             pt.data.mul_(momentum).add_(ps.data, alpha=1.0 - momentum)
+
+
+def maybe_refresh_gram_teacher(
+    cfg: dict[str, Any],
+    bundle: ModelBundle,
+    iteration: int,
+    updates_done: int,
+) -> int:
+    if bundle.gram_teacher is None:
+        return updates_done
+
+    it_load = int(get_cfg(cfg, ("gram", "it_load_ema_teacher"), -1))
+    if not bundle.gram_teacher_initialized and it_load >= 0 and iteration >= it_load:
+        copy_gram_teacher_from_teacher(bundle)
+        logger.info("initialized Gram teacher from EMA teacher at iteration %d", iteration + 1)
+
+    if not bool(get_cfg(cfg, ("gram", "rep_update"), False)) or not bundle.gram_teacher_initialized:
+        return updates_done
+
+    max_updates = get_cfg(cfg, ("gram", "max_updates"), None)
+    if max_updates is not None and updates_done >= int(max_updates):
+        return updates_done
+
+    first_update = int(get_cfg(cfg, ("gram", "it_first_update"), 0))
+    update_frequency = max(1, int(get_cfg(cfg, ("gram", "update_frequency"), 50000)))
+    if iteration >= first_update and (iteration - first_update) % update_frequency == 0:
+        copy_gram_teacher_from_teacher(bundle)
+        updates_done += 1
+        logger.info("updated Gram teacher from EMA teacher at iteration %d", iteration + 1)
+    return updates_done
+
+
+def _resize_patch_tokens_to_match(
+    source: torch.Tensor,
+    target_num_patches: int,
+    *,
+    mode: str,
+    antialias: bool,
+) -> torch.Tensor:
+    if source.shape[1] == target_num_patches:
+        return source
+    source_side = math.isqrt(source.shape[1])
+    target_side = math.isqrt(target_num_patches)
+    if source_side * source_side != source.shape[1] or target_side * target_side != target_num_patches:
+        raise ValueError(
+            f"Cannot resize non-square patch tokens from {source.shape[1]} to {target_num_patches} patches"
+        )
+    source_grid = source.transpose(1, 2).reshape(source.shape[0], source.shape[2], source_side, source_side)
+    align_corners = False if mode in {"linear", "bilinear", "bicubic", "trilinear"} else None
+    resized = F.interpolate(
+        source_grid,
+        size=(target_side, target_side),
+        mode=mode,
+        align_corners=align_corners,
+        antialias=antialias if mode in {"bilinear", "bicubic"} else False,
+    )
+    return resized.flatten(2).transpose(1, 2)
+
+
+def _select_gram_tokens(
+    student_tokens: torch.Tensor,
+    teacher_tokens: torch.Tensor,
+    masks: torch.Tensor,
+    tokens_used: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tokens_used == "all":
+        return student_tokens, teacher_tokens
+    if tokens_used == "masked":
+        selection = masks
+    elif tokens_used == "unmasked":
+        selection = ~masks
+    else:
+        raise ValueError("gram.tokens_used must be one of: all, masked, unmasked")
+    return student_tokens[selection], teacher_tokens[selection]
 
 
 def apply_freeze_last_layer(head: DINOHead, iteration: int, freeze_until: int) -> None:
@@ -470,6 +682,25 @@ def train(
         student_temp=float(get_cfg(cfg, ("ibot", "student_temp"), 0.1)),
     ).to(device)
     koleo_loss = KoLeoLoss().to(device)
+    gram_use_loss = bool(get_cfg(cfg, ("gram", "use_loss"), False))
+    gram_img_level = bool(get_cfg(cfg, ("gram", "img_level"), False))
+    gram_tokens_used = str(get_cfg(cfg, ("gram", "tokens_used"), "all")).lower()
+    if gram_img_level and gram_tokens_used != "all":
+        raise ValueError("gram.tokens_used=masked/unmasked is only supported with gram.img_level=false.")
+    gram_loss = (
+        GramLoss(
+            apply_norm=bool(get_cfg(cfg, ("gram", "normalized"), True)),
+            remove_neg=bool(get_cfg(cfg, ("gram", "remove_neg"), False)),
+            remove_only_teacher_neg=bool(get_cfg(cfg, ("gram", "remove_only_teacher_neg"), False)),
+        ).to(device)
+        if gram_use_loss
+        else None
+    )
+    gram_ema_teacher = bool(get_cfg(cfg, ("gram", "ema_teacher"), False))
+    if gram_ema_teacher and _cfg_path_is_set(get_cfg(cfg, ("gram", "ckpt"), None)):
+        raise ValueError("Cannot use both gram.ema_teacher=true and gram.ckpt.")
+    if gram_ema_teacher and get_cfg(cfg, ("crops", "gram_teacher_crops_size"), None) is not None:
+        raise ValueError("crops.gram_teacher_crops_size must be null when gram.ema_teacher=true.")
 
     scaler = amp.GradScaler("cuda", enabled=bool(get_cfg(cfg, ("compute_precision", "grad_scaler"), True)))
     centering = str(get_cfg(cfg, ("train", "centering"), "centering")).lower()
@@ -484,10 +715,15 @@ def train(
     metrics_fh = metrics_path.open("a", newline="")
     metrics_writer = csv.writer(metrics_fh)
     if metrics_path.stat().st_size == 0:
-        metrics_writer.writerow(["step", "loss", "dino", "ibot", "lr", "weight_decay", "teacher_temp", "momentum"])
+        metrics_writer.writerow(
+            ["step", "loss", "dino", "ibot", "gram", "lr", "weight_decay", "teacher_temp", "momentum"]
+        )
 
     logger.info("starting DINOv3 training: %d iterations (~%d epochs)", total_iters, total_iters // epoch_length)
+    saveckp_freq = int(get_cfg(cfg, ("train", "saveckp_freq"), 0))
+    checkpoint_period = saveckp_freq * epoch_length if saveckp_freq > 0 else 0
     iterator = iter(data_loader)
+    gram_updates_done = 0
     for iteration in range(total_iters):
         try:
             batch = next(iterator)
@@ -499,6 +735,9 @@ def train(
         weight_decay = schedules.weight_decay[iteration]
         momentum = schedules.momentum[iteration]
         teacher_temp = schedules.teacher_temp[iteration]
+        gram_weight = schedules.gram_loss_weight[iteration]
+        if gram_use_loss:
+            gram_updates_done = maybe_refresh_gram_teacher(cfg, bundle, iteration, gram_updates_done)
 
         for group in optimizer.param_groups:
             group["lr"] = lr * group.get("lr_multiplier", 1.0)
@@ -516,12 +755,17 @@ def train(
         n_masked = int(mask_indices_list.numel())
 
         global_list = list(global_crops.chunk(2))
+        teacher_global_crops = batch.get("collated_global_crops_teacher", batch["collated_global_crops"])
+        teacher_global_list = list(teacher_global_crops.to(device, non_blocking=True).chunk(2))
         local_list = list(local_crops.chunk(int(get_cfg(cfg, ("crops", "local_crops_number"), 8))))
         global_masks = list(masks.chunk(2))
         mask_list = global_masks + [None for _ in local_list]
 
         with torch.no_grad():
-            teacher_outputs = bundle.teacher.forward_features_list(global_list, [None for _ in global_list])
+            teacher_outputs = bundle.teacher.forward_features_list(
+                teacher_global_list,
+                [None for _ in teacher_global_list],
+            )
             teacher_cls = [o["x_norm_clstoken"] for o in teacher_outputs]
             teacher_patches = [o["x_norm_patchtokens"] for o in teacher_outputs]
             teacher_logits = [bundle.teacher_head(t) for t in teacher_cls]
@@ -554,18 +798,50 @@ def train(
             else:
                 teacher_ibot_targets = None
 
+            gram_teacher_patches = None
+            if gram_use_loss and gram_weight > 0:
+                if gram_ema_teacher:
+                    gram_teacher_patches = teacher_patches
+                else:
+                    if bundle.gram_teacher is None or not bundle.gram_teacher_initialized:
+                        raise RuntimeError("Gram loss is active, but the Gram teacher has not been initialized.")
+                    gram_crops = batch.get("collated_gram_teacher_crops")
+                    if gram_crops is not None:
+                        gram_list = list(gram_crops.to(device, non_blocking=True).chunk(2))
+                    else:
+                        gram_list = global_list
+                    gram_outputs = bundle.gram_teacher.forward_features_list(gram_list, [None for _ in gram_list])
+                    gram_teacher_patches = [o["x_norm_patchtokens"] for o in gram_outputs]
+
         with amp.autocast(device_type="cuda", enabled=scaler.is_enabled()):
             student_outputs = bundle.student.forward_features_list(global_list + local_list, mask_list)
             student_cls = [o["x_norm_clstoken"] for o in student_outputs]
             student_patches = [o["x_norm_patchtokens"] for o in student_outputs[:2]]  # mask applied only to globals
 
             student_logits = [bundle.student_head(t) for t in student_cls]
-            dino_term = dino_loss(student_logits, list(teacher_targets_split)) / len(student_logits)
+            teacher_targets = list(teacher_targets_split)
+            student_global_logits = student_logits[:2]
+            student_local_logits = student_logits[2:]
+            n_global_loss_terms = len(student_global_logits) * len(teacher_targets) - min(
+                len(student_global_logits), len(teacher_targets)
+            )
+            n_local_loss_terms = len(student_local_logits) * len(teacher_targets)
+            dino_global = dino_loss(student_global_logits, teacher_targets, ignore_diagonal=True)
+            dino_local = (
+                dino_loss(student_local_logits, teacher_targets)
+                if student_local_logits
+                else torch.tensor(0.0, device=device)
+            )
+            dino_term = (dino_global * n_global_loss_terms + dino_local * n_local_loss_terms) / (
+                n_global_loss_terms + n_local_loss_terms
+            )
             loss = float(get_cfg(cfg, ("dino", "loss_weight"), 1.0)) * dino_term
 
             koleo_weight = float(get_cfg(cfg, ("dino", "koleo_loss_weight"), 0.0))
             if koleo_weight > 0:
-                loss = loss + koleo_weight * koleo_loss(teacher_concat)
+                n_global = len(student_global_logits)
+                koleo_term = sum(koleo_loss(t) for t in student_cls[:n_global]) / n_global
+                loss = loss + koleo_weight * n_global * koleo_term
 
             ibot_weight = float(get_cfg(cfg, ("ibot", "loss_weight"), 1.0))
             ibot_term = torch.tensor(0.0, device=device)
@@ -583,6 +859,28 @@ def train(
                 )
                 loss = loss + ibot_weight * ibot_term
 
+            gram_term = torch.tensor(0.0, device=device)
+            if gram_loss is not None and gram_weight > 0:
+                if gram_teacher_patches is None:
+                    raise RuntimeError("Gram teacher features were not computed for an active Gram loss.")
+                gram_student = torch.cat(student_patches, dim=0)
+                gram_teacher = torch.cat(gram_teacher_patches, dim=0)
+                gram_teacher = _resize_patch_tokens_to_match(
+                    gram_teacher,
+                    gram_student.shape[1],
+                    mode=str(get_cfg(cfg, ("gram", "global_teacher_resize_method"), "bicubic")),
+                    antialias=bool(get_cfg(cfg, ("gram", "global_teacher_resize_antialias"), False)),
+                )
+                gram_student, gram_teacher = _select_gram_tokens(
+                    gram_student,
+                    gram_teacher,
+                    masks,
+                    gram_tokens_used,
+                )
+                if gram_student.numel() > 0:
+                    gram_term = gram_loss(gram_student, gram_teacher, img_level=gram_img_level)
+                    loss = loss + gram_weight * gram_term
+
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         clip_grad = float(get_cfg(cfg, ("optim", "clip_grad"), 0.0))
@@ -590,13 +888,16 @@ def train(
             scaler.unscale_(optimizer)
             params_to_clip = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
             nn.utils.clip_grad_norm_(params_to_clip, max_norm=clip_grad)
+        old_scale = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
 
-        update_teacher_weights(bundle.student, bundle.teacher, momentum)
-        update_teacher_weights(bundle.student_head, bundle.teacher_head, momentum)
-        if bundle.student_ibot_head is not None and bundle.teacher_ibot_head is not None:
-            update_teacher_weights(bundle.student_ibot_head, bundle.teacher_ibot_head, momentum)
+        step_skipped = scaler.is_enabled() and scaler.get_scale() < old_scale
+        if not step_skipped:
+            update_teacher_weights(bundle.student, bundle.teacher, momentum)
+            update_teacher_weights(bundle.student_head, bundle.teacher_head, momentum)
+            if bundle.student_ibot_head is not None and bundle.teacher_ibot_head is not None:
+                update_teacher_weights(bundle.student_ibot_head, bundle.teacher_ibot_head, momentum)
 
         if (iteration + 1) % max(1, int(get_cfg(cfg, ("train", "log_every"), 10))) == 0 or iteration == 0:
             metrics_writer.writerow(
@@ -605,6 +906,7 @@ def train(
                     float(loss.detach()),
                     float(dino_term.detach()),
                     float(ibot_term.detach()),
+                    float(gram_term.detach()),
                     lr,
                     weight_decay,
                     teacher_temp,
@@ -613,32 +915,56 @@ def train(
             )
             metrics_fh.flush()
             logger.info(
-                "[%05d/%05d] loss=%.4f dino=%.4f ibot=%.4f lr=%.6f wd=%.4f temp=%.3f mom=%.4f",
+                "[%05d/%05d] loss=%.4f dino=%.4f ibot=%.4f gram=%.4f lr=%.6f wd=%.4f temp=%.3f mom=%.4f",
                 iteration + 1,
                 total_iters,
                 float(loss.detach()),
                 float(dino_term.detach()),
                 float(ibot_term.detach()),
+                float(gram_term.detach()),
                 lr,
                 weight_decay,
                 teacher_temp,
                 momentum,
             )
 
+        step = iteration + 1
+        if checkpoint_period > 0 and step % checkpoint_period == 0 and step < total_iters:
+            checkpoint_path = pretrain_dir / f"checkpoint_{step:07d}.pth"
+            save_pretrain_checkpoint(
+                checkpoint_path,
+                build_pretrain_checkpoint(
+                    bundle,
+                    cfg,
+                    iteration=step,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    extra={
+                        "dino_loss": dino_loss.state_dict(),
+                        "ibot_loss": ibot_loss.state_dict(),
+                        "gram_updates_done": gram_updates_done,
+                    },
+                ),
+            )
+            logger.info("periodic checkpoint saved to %s", checkpoint_path)
+
     pretrain_dir = output_dir / "pretrain"
     pretrain_dir.mkdir(parents=True, exist_ok=True)
     pretrain_path = pretrain_dir / "dinov3_pretrain.pth"
-    torch.save(
-        {
-            "student": bundle.student.state_dict(),
-            "student_head": bundle.student_head.state_dict(),
-            "student_ibot_head": bundle.student_ibot_head.state_dict() if bundle.student_ibot_head else None,
-            "teacher": bundle.teacher.state_dict(),
-            "teacher_head": bundle.teacher_head.state_dict(),
-            "teacher_ibot_head": bundle.teacher_ibot_head.state_dict() if bundle.teacher_ibot_head else None,
-            "config": cfg,
-        },
+    save_pretrain_checkpoint(
         pretrain_path,
+        build_pretrain_checkpoint(
+            bundle,
+            cfg,
+            iteration=total_iters,
+            optimizer=optimizer,
+            scaler=scaler,
+            extra={
+                "dino_loss": dino_loss.state_dict(),
+                "ibot_loss": ibot_loss.state_dict(),
+                "gram_updates_done": gram_updates_done,
+            },
+        ),
     )
     (pretrain_dir / "config_used.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     metrics_fh.close()
@@ -750,16 +1076,12 @@ def main() -> None:
         device = torch.device("cuda")
         post_dir = output_dir / "post_train"
         setup_file_logging(post_dir / "post_train.log")
-        # Load backbone weights from checkpoint if provided, else from freshly trained student
         backbone = None
         pretrain_path = output_dir / "pretrain" / "dinov3_pretrain.pth"
         ckpt_path = args.pretrained_backbone if (args.post_train_only and args.pretrained_backbone) else pretrain_path
         ckpt = torch.load(ckpt_path, map_location="cpu")
         state = ckpt.get("student", ckpt.get("model", ckpt))
-        arch_raw = str(get_cfg(cfg, ("student", "arch"), "vit_small"))
-        arch = arch_raw.replace("vit_", "") if arch_raw.startswith("vit_") else arch_raw
-        patch_size = int(get_cfg(cfg, ("student", "patch_size"), 14))
-        backbone = build_backbone(arch, patch_size=patch_size)
+        backbone = _build_backbone_from_cfg(cfg, torch.device("cpu"))
         backbone.load_state_dict(state, strict=False)
         backbone.to(device)
         for p in backbone.parameters():

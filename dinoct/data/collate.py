@@ -16,6 +16,13 @@ def collate_data_and_cast(
     n_local_crops = len(samples_list[0][0]["local_crops"])
 
     collated_global_crops = torch.stack([s[0]["global_crops"][i] for i in range(n_global_crops) for s in samples_list])
+    collated_global_crops_teacher = torch.stack(
+        [
+            s[0].get("global_crops_teacher", s[0]["global_crops"])[i]
+            for i in range(n_global_crops)
+            for s in samples_list
+        ]
+    )
 
     collated_local_crops = torch.stack([s[0]["local_crops"][i] for i in range(n_local_crops) for s in samples_list])
 
@@ -66,6 +73,7 @@ def collate_data_and_cast(
 
     out = {
         "collated_global_crops": collated_global_crops.to(dtype),
+        "collated_global_crops_teacher": collated_global_crops_teacher.to(dtype),
         "collated_local_crops": collated_local_crops.to(dtype),
         "collated_masks": collated_masks,
         "mask_indices_list": mask_indices_list,

@@ -116,7 +116,7 @@ class DataAugmentationDINO(object):
                     scale=local_crops_scale,
                     interpolation=tv.InterpolationMode.BICUBIC,
                 ),
-                tv.RandomHorizontalFlip(p=0.5),
+                tv.RandomHorizontalFlip(p=0.5 if horizontal_flips else 0.0),
             ]
         )
 

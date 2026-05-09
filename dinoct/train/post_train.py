@@ -371,8 +371,8 @@ class CurveModel(nn.Module):
         pt, _, pl, _ = pads
         H_pad, W_pad = x.shape[-2], x.shape[-1]
         outputs = self.backbone.forward_features(x)
-        # cls = outputs[0]["x_norm_clstoken"]
-        patch_tokens = outputs[0]["x_norm_patchtokens"]
+        # cls = outputs["x_norm_clstoken"]
+        patch_tokens = outputs["x_norm_patchtokens"]
         H_tokens = H_pad // self.patch_size
         W_tokens = W_pad // self.patch_size
         tokens_hw = patch_tokens.reshape(x.shape[0], H_tokens, W_tokens, -1).permute(0, 3, 1, 2).contiguous()

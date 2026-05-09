@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from eval.classical import (  # noqa: E402
     AVAILABLE_METHODS,
-    CLASSICAL_METHODS,
+    CLASSICAL_METHOD_SPECS,
     detect_surface_curve,
     resolve_method_key,
 )
@@ -194,7 +194,7 @@ def _evaluate_method(
     overlay_limit: int,
 ) -> dict[str, Any]:
     method_key = resolve_method_key(method)
-    method_spec = CLASSICAL_METHODS[method_key]
+    method_spec = CLASSICAL_METHOD_SPECS[method_key]
     entries = dataset._get_entries()
     root = Path(dataset.root)
     out_dir = output_dir / method_key
@@ -449,7 +449,7 @@ def main() -> None:
     )
     output_suffix = corruption_output_suffix(args.corruption, args.severity)
     output_dir = args.output_dir or (REPO_ROOT / "outputs" / "classical_eval" / f"{eval_split_name}{output_suffix}")
-    methods = list(CLASSICAL_METHODS) if args.method == "all" else [resolve_method_key(str(args.method))]
+    methods = list(CLASSICAL_METHOD_SPECS) if args.method == "all" else [resolve_method_key(str(args.method))]
     dataset_root = Path(dataset_tokens["root"])
     default_fallback_background = dataset_root / "background" / "background.jpg"
     fallback_background_path = (

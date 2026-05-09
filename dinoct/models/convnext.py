@@ -76,7 +76,6 @@ class ConvNeXt(nn.Module):
     Key differences vs vanilla ConvNeXt:
     - Exposes `forward_features_list()` returning dicts with `x_norm_clstoken` / `x_norm_patchtokens`.
     - Supports iBOT-style masking by zeroing masked *input* patches (pixel-space masking).
-    - Optionally resizes the final feature map to match a given `patch_size` token grid.
     """
 
     def __init__(
@@ -88,15 +87,23 @@ class ConvNeXt(nn.Module):
         drop_path_rate: float = 0.0,
         layer_scale_init_value: float = 1e-6,
         patch_size: int | None = None,
+        stem_patch_size: int = 4,
+        stem_stride: int | None = None,
     ) -> None:
         super().__init__()
 
-        self.patch_size = patch_size
+        stem_stride = int(stem_patch_size if stem_stride is None else stem_stride)
+        self.native_patch_size = stem_stride * 2**3
+        self.patch_size = int(patch_size if patch_size is not None else self.native_patch_size)
+        if self.patch_size != self.native_patch_size:
+            raise ValueError(
+                f"ConvNeXt patch_size must match native stride {self.native_patch_size}, got {self.patch_size}."
+            )
         self.n_storage_tokens = 0
 
         self.downsample_layers = nn.ModuleList()
         stem = nn.Sequential(
-            nn.Conv2d(in_chans, int(dims[0]), kernel_size=4, stride=4),
+            nn.Conv2d(in_chans, int(dims[0]), kernel_size=int(stem_patch_size), stride=stem_stride),
             LayerNorm(int(dims[0]), eps=1e-6, data_format="channels_first"),
         )
         self.downsample_layers.append(stem)
@@ -169,14 +176,14 @@ class ConvNeXt(nn.Module):
         return x.masked_fill(mask_px[:, None].to(device=x.device, dtype=torch.bool), 0.0)
 
     def _maybe_resize_tokens(self, feats: Tensor, *, input_hw: tuple[int, int]) -> Tensor:
-        if self.patch_size is None:
-            return feats
         H, W = input_hw
-        ph = int(self.patch_size)
-        target_h, target_w = H // ph, W // ph
+        target_h, target_w = H // self.patch_size, W // self.patch_size
         if (feats.shape[-2], feats.shape[-1]) == (target_h, target_w):
             return feats
-        return F.interpolate(feats, size=(target_h, target_w), mode="bilinear", antialias=True)
+        raise ValueError(
+            "ConvNeXt feature grid does not match the configured native token grid: "
+            f"features={tuple(feats.shape[-2:])}, expected={(target_h, target_w)}."
+        )
 
     def forward_features_list(self, x_list: list[Tensor], masks_list: list[Tensor | None]) -> list[dict[str, Tensor]]:
         output: list[dict[str, Tensor]] = []
@@ -197,10 +204,11 @@ class ConvNeXt(nn.Module):
             x_seq = x_tokens.flatten(2).transpose(1, 2)  # (B, HW, C)
 
             x_norm = self.norm(torch.cat([x_pool.unsqueeze(1), x_seq], dim=1))
+            storage = x_norm[:, 1:1]
             output.append(
                 {
                     "x_norm_clstoken": x_norm[:, 0],
-                    "x_norm_regtokens": x_norm[:, 1:1],  # empty
+                    "x_storage_tokens": storage,
                     "x_norm_patchtokens": x_norm[:, 1:],
                     "x_prenorm": x_seq,
                     "masks": masks,
@@ -208,22 +216,26 @@ class ConvNeXt(nn.Module):
             )
         return output
 
-    def forward_features(self, x: Tensor | list[Tensor], masks: Tensor | None = None) -> list[dict[str, Tensor]]:
+    def forward_features(
+        self, x: Tensor | list[Tensor], masks: Tensor | list[Tensor | None] | None = None
+    ) -> dict[str, Tensor] | list[dict[str, Tensor]]:
         if isinstance(x, torch.Tensor):
-            return self.forward_features_list([x], [masks])
+            return self.forward_features_list([x], [masks])[0]
         if masks is None:
             return self.forward_features_list(x, [None for _ in x])
         if isinstance(masks, list):
             return self.forward_features_list(x, masks)
-        raise TypeError("When `x` is a list, `masks` must be a list[Tensor|None] or None.")
+        raise TypeError("When `x` is a list, `masks` must be list[Tensor|None] or None.")
 
     def forward(
         self, x: Tensor, *, is_training: bool = False, masks: Tensor | None = None
-    ) -> Tensor | list[dict[str, Tensor]]:
+    ) -> Tensor | dict[str, Tensor] | list[dict[str, Tensor]]:
         ret = self.forward_features(x, masks=masks)
         if is_training:
             return ret
-        return self.head(ret[0]["x_norm_clstoken"])
+        if isinstance(ret, list):
+            raise TypeError("ConvNeXt.forward expects Tensor input when is_training=False.")
+        return self.head(ret["x_norm_clstoken"])
 
 
 _CONVNEXT_SPECS: dict[str, dict[str, Sequence[int]]] = {

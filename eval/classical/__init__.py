@@ -1,6 +1,5 @@
 from .methods import (
     AVAILABLE_METHODS,
-    CLASSICAL_METHODS,
     CLASSICAL_METHOD_SPECS,
     ClassicalMethodSpec,
     apply_classical_method,
@@ -10,7 +9,6 @@ from .methods import (
 
 __all__ = [
     "AVAILABLE_METHODS",
-    "CLASSICAL_METHODS",
     "CLASSICAL_METHOD_SPECS",
     "ClassicalMethodSpec",
     "apply_classical_method",

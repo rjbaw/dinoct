@@ -44,9 +44,6 @@ CLASSICAL_METHOD_SPECS: dict[str, ClassicalMethodSpec] = {
     ),
 }
 
-# Backward-compatible alias for older code paths.
-CLASSICAL_METHODS = CLASSICAL_METHOD_SPECS
-
 METHOD_ALIASES: dict[str, str] = {
     "engineered": "grad_eng",
     "detect_lines_savgol": "grad_sg",

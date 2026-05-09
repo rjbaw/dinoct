@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dinoct.data.transforms import Ensure3CH, MaybeToTensor, PerImageZScore  # noqa: E402
-from dinoct.models import build_backbone  # noqa: E402
+from dinoct.models import build_backbone, native_patch_size_for_backbone  # noqa: E402
 from dinoct.train.post_train import (  # noqa: E402
     CurveModel,
     ORIG_H,
@@ -98,12 +98,14 @@ def load_backbone_from_pretrain(ckpt_path: Path, device: torch.device) -> tuple[
         arch,
         patch_size=patch_size,
         drop_path_rate=float(student_cfg.get("drop_path_rate", 0.0)),
+        drop_path_uniform=bool(student_cfg.get("drop_path_uniform", False)),
+        block_chunks=int(student_cfg.get("block_chunks", 0)),
         layerscale_init=student_cfg.get("layerscale", None),
         ffn_layer=_resolve_ffn_layer(str(student_cfg.get("ffn_layer", "mlp"))),
         qkv_bias=bool(student_cfg.get("qkv_bias", True)),
         proj_bias=bool(student_cfg.get("proj_bias", True)),
         ffn_bias=bool(student_cfg.get("ffn_bias", True)),
-        n_storage_tokens=int(student_cfg.get("num_register_tokens", 0)),
+        n_storage_tokens=int(student_cfg.get("n_storage_tokens", 0)),
         mask_k_bias=bool(student_cfg.get("mask_k_bias", False)),
         device=device,
     ).to(device)
@@ -481,7 +483,7 @@ def prepare_curve_model(args: argparse.Namespace, *, device: torch.device) -> tu
     backbone_name = inferred_name or (None if args.backbone == "auto" else args.backbone)
     if backbone_name is None:
         raise ValueError("Could not infer backbone from curve checkpoint; pass --backbone explicitly.")
-    patch_size = int(inferred_patch or args.patch_size)
+    patch_size = int(inferred_patch or native_patch_size_for_backbone(backbone_name, int(args.patch_size)))
 
     model = load_curve_model(
         ckpt_path=ckpt_path,
@@ -593,8 +595,8 @@ def prepare_backbone(args: argparse.Namespace, *, device: torch.device) -> tuple
         backbone, patch_size = load_backbone_from_pretrain(ckpt_path, device=device)
     else:
         arch = "small" if args.backbone == "auto" else _resolve_arch(args.backbone)
-        backbone = build_backbone(arch, patch_size=args.patch_size, device=device).to(device).eval()
-        patch_size = int(args.patch_size)
+        patch_size = native_patch_size_for_backbone(arch, int(args.patch_size))
+        backbone = build_backbone(arch, patch_size=patch_size, device=device).to(device).eval()
     return backbone, patch_size
 
 
@@ -661,7 +663,7 @@ def run_features_image(
                 raise ValueError("Attention visualizations require a ViT backbone; use `--attn none` for ConvNeXt.")
             H_tokens, W_tokens = int(x.shape[-2] // patch_size), int(x.shape[-1] // patch_size)
 
-        out = backbone.forward_features(x)[0]  # type: ignore[attr-defined]
+        out = backbone.forward_features(x)  # type: ignore[attr-defined]
     if hook is not None:
         hook.remove()
 

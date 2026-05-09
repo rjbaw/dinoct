@@ -23,7 +23,7 @@ def build_backbone(name: str, *, patch_size: int = 14, **kwargs: Any) -> nn.Modu
 
     vit_builder = _BACKBONES.get(arch)
     if vit_builder is not None:
-        model = vit_builder(patch_size=patch_size, **kwargs)
+        model = vit_builder(patch_size=int(patch_size if patch_size is not None else 14), **kwargs)
         model.init_weights()
         return model
 

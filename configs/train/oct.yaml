@@ -2,24 +2,26 @@ dino:
   head_n_prototypes: 16384
   head_bottleneck_dim: 256
   head_hidden_dim: 2048
+gram:
+  use_loss: true
+  ema_teacher: true
 ibot:
-  separate_head: false
+  separate_head: true
   head_n_prototypes: 16384
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
 train:
   dataset_path: OCT:root=data/oct:hub=rjbaw/oct
-  batch_size_per_gpu: 32
+  batch_size_per_gpu: 96
   OFFICIAL_EPOCH_LENGTH: 1250
   centering: sinkhorn_knopp
   mp_start_method: spawn
 student:
   arch: convnext_tiny
-  patch_size: 14
+  patch_size: 32
   drop_path_rate: 0.4
   ffn_layer: swiglufused
-  block_chunks: 4
 teacher:
   momentum_teacher: 0.994
 optim:
@@ -31,7 +33,7 @@ optim:
   min_lr: 1.0e-06
   layerwise_decay: 1.0
 crops:
-  local_crops_size: 98
+  local_crops_size: 96
 post_train:
   steps: 1500
   method: sam
