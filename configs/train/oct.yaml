@@ -1,0 +1,106 @@
+dino:
+  loss_weight: 1.0
+  head_n_prototypes: 16384
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1
+gram:
+  use_loss: false
+ibot:
+  loss_weight: 1.0
+  separate_head: false
+  head_n_prototypes: 16384
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+train:
+  dataset_path: OCT:root=data/oct:hub=rjbaw/oct
+  batch_size_per_gpu: 32
+  OFFICIAL_EPOCH_LENGTH: 1250
+  centering: sinkhorn_knopp
+  mp_start_method: spawn
+  saveckp_freq: 20
+  seed: 0
+  num_workers: 10
+  cache_dataset: true
+  solarize_p: 0.2
+  # Threshold applies to the pre-normalization uint8 image; the paper runs used 0.5.
+  solarize_threshold: 0.5
+  aggressive_aug: true
+  compile: true
+student:
+  arch: convnext_tiny
+  patch_size: 14
+  drop_path_rate: 0.4
+  ffn_layer: swiglufused
+  layerscale: 1.0e-05
+  drop_path_uniform: false
+  block_chunks: 4
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  n_storage_tokens: 0
+teacher:
+  momentum_teacher: 0.994
+  final_momentum_teacher: 1.0
+  teacher_temp: 0.07
+  warmup_teacher_temp: 0.04
+  warmup_teacher_temp_epochs: 30
+  teacher_no_color_jitter: false
+optim:
+  epochs: 500
+  weight_decay: 0.04
+  weight_decay_end: 0.2
+  base_lr: 2.0e-04
+  warmup_epochs: 80
+  min_lr: 1.0e-06
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 1.0
+  patch_embed_lr_mult: 1.0
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 1
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+crops:
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_number: 8
+  local_crops_size: 98
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  global_crops_size: 224
+  gram_teacher_crops_size: null
+  gram_teacher_no_distortions: false
+post_train:
+  steps: 1500
+  method: sam
+  #batch_size: 256
+  #batch_size: 192
+  batch_size: 128
+  lr_head: 5.0e-04
+  lr_lora: 1.0e-04
+  wd_head: 1.0e-03
+  wd_lora: 5.0e-05
+  lr_warmup: 0
+  val_every: 1
+  min_lr_mult: 1.0
+  ema_decay: 0.99
+  sigma: 1.5
+  lambda_curve: 1.0
+  lambda_curv: 0.05
+  eps_none: 0.02
+  curv_delta: 1.0
+  lora_blocks: 6
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.02
+  lora_use_mlp: false
+  sam:
+    rho: 0.05
