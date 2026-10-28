@@ -31,7 +31,9 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "train" / "oct.yaml"
 DEFAULT_STRESS_DIR = REPO_ROOT / "data" / "oct" / "eval" / "stress"
 DEFAULT_BACKBONE = REPO_ROOT / "outputs" / "pretrain" / "dinov3_pretrain.pth"
 DEFAULT_FULL_TRAIN_REFERENCE_CSV = PAPER_DATA_EFF_ROOT / "full_train_references.csv"
-PAPER_SEEDS = [0, 1, 2, 3, 4]  # every paper table (main + ablations) uses these five seeds
+DEFAULT_INITIALIZATION_INPUT = PAPER_RESULTS_ROOT / "initialization" / "paired_seed_results.csv"
+DEFAULT_INITIALIZATION_OUTPUT_ROOT = PAPER_RESULTS_ROOT / "initialization"
+PAPER_SEEDS = [0, 1, 2, 3, 4]  # original main and ablation studies; initialization uses seeds 1-3
 
 
 def _add_bundle_args(parser: argparse.ArgumentParser) -> None:
@@ -151,6 +153,13 @@ def _add_lora_ablation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resume", action="store_true")
 
 
+def _add_initialization_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input-csv", type=Path, default=DEFAULT_INITIALIZATION_INPUT)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_INITIALIZATION_OUTPUT_ROOT)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--check-only", action="store_true")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Paper replication entrypoint.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -172,6 +181,9 @@ def parse_args() -> argparse.Namespace:
 
     p = sub.add_parser("lora-placement", help="Run the LoRA-placement sensitivity table.")
     _add_lora_ablation_args(p)
+
+    p = sub.add_parser("initialization", help="Aggregate historical initialization scores into CSV/JSON; no training or inference.", allow_abbrev=False)
+    _add_initialization_args(p)
 
     p = sub.add_parser(
         "classical",
@@ -198,6 +210,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-norms", action="store_true")
     p.add_argument("--skip-lora-placement", action="store_true")
     p.add_argument("--write-overlays", action="store_true")
+    p.add_argument("--initialization-input", type=Path,
+                   help="Also aggregate this archived initialization per-seed CSV (no initialization training).")
+    p.add_argument("--initialization-output-root", type=Path, default=DEFAULT_INITIALIZATION_OUTPUT_ROOT)
 
     return parser.parse_args()
 
@@ -673,6 +688,17 @@ def _run_low_data(args: argparse.Namespace) -> None:
     _run(cmd)
 
 
+def _run_initialization(args: argparse.Namespace, *, check_only: bool = False) -> None:
+    cmd = [sys.executable, str(REPO_ROOT / "eval/paper/initialization.py"),
+           "--input-csv", str(Path(args.input_csv).resolve()),
+           "--output-root", str(Path(args.output_root).resolve())]
+    if args.resume:
+        cmd.append("--resume")
+    if check_only or getattr(args, "check_only", False):
+        cmd.append("--check-only")
+    _run(cmd)
+
+
 def main() -> None:
     args = parse_args()
     if args.command == "main":
@@ -699,7 +725,15 @@ def main() -> None:
     if args.command == "low-data":
         _run_low_data(args)
         return
+    if args.command == "initialization":
+        _run_initialization(args)
+        return
     if args.command == "all":
+        initialization = None
+        if args.initialization_input is not None:
+            initialization = argparse.Namespace(input_csv=args.initialization_input,
+                output_root=args.initialization_output_root, resume=args.resume)
+            _run_initialization(initialization, check_only=True)
         _run_main_bundle(args)
         _run_robustness_suite(args)
         _run_ablations(args)
@@ -708,6 +742,8 @@ def main() -> None:
         if not getattr(args, "skip_lora_placement", False):
             _run_lora_ablations(args)
         _run_low_data(args)
+        if initialization is not None:
+            _run_initialization(initialization)
         return
     raise SystemExit(f"Unhandled command: {args.command}")
 

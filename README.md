@@ -156,22 +156,38 @@ present:
 uv run python eval/run_paper.py pretrain
 ```
 
-Run the full OCT paper pipeline (trains and evaluates everything into `outputs/paper_results/`):
+Run the OCT paper pipeline (training and evaluation into `outputs/paper_results/`):
 
 ```bash
 uv run python eval/run_paper.py all
 ```
 
-The defaults ARE the paper protocol (seeds 0-4, post-train batch size 128) — do not override
-them when reproducing paper numbers. Every experiment writes per-recording CSV/JSON summaries
+The defaults retain the paper's seeds (0–4) and post-train batch size (128).
+Every experiment writes per-recording CSV/JSON summaries
 under `outputs/paper_results/`; the paper reports the mean±std across recordings of the
 seed-averaged per-recording metric. Use `--resume` to continue an interrupted run. Individual stages (`main`, `classical`,
 `robustness`, `ablations`, `norms`, `lora-placement`, `low-data`) are available via
 `eval/run_paper.py --help` if you only need one table.
+
 - `classical` regenerates the classical OCT baselines into `outputs/paper_results/classical_eval/`.
 - `robustness` regenerates the learned-model robustness suite and also refreshes the classical artifacts required by the paper robustness and failure-rate tables.
 - `ablations` reruns the final single-component DINOCT ablations and can aggregate multiple seeds into `final_component_ablation.csv` plus per-seed rows in `final_component_ablation_per_seed.csv`.
 - `low-data` regenerates the label-budget comparison and rewrites the data-efficiency manifests.
+- `initialization` aggregates the released per-seed initialization scores into CSV/JSON summaries; it does not retrain models.
+
+For the initialization comparison, extract the results release under `outputs/`, then run:
+
+```bash
+unzip /path/to/paper_results_release_20261027.zip -d outputs
+uv run python eval/run_paper.py initialization --resume
+```
+
+This reads `outputs/paper_results/initialization/paired_seed_results.csv` and writes
+`initialization_summary.csv` and `.json` beside it. `mae_px_seed_std` is population
+std across downstream seeds 1–3 after equal-recording averaging. It uses the
+paper's historical scoring view, not corrected-label scoring. Use `--input-csv`
+and `--output-root` to override paths. To include this aggregation after `all`,
+pass `--initialization-input outputs/paper_results/initialization/paired_seed_results.csv`.
 
 ## License
 Apache-2.0, with one exception described below.
